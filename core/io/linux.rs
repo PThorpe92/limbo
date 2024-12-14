@@ -83,11 +83,15 @@ impl WrappedIOUring {
     fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Rc<Completion>) {
         log::trace!("submit_entry({:?})", entry);
         self.pending.insert(entry.get_user_data(), c);
-        unsafe {
-            self.ring
-                .submission()
-                .push(entry)
-                .expect("submission queue is full");
+        loop {
+            let sub = unsafe { self.ring.submission().push(entry) };
+            match sub {
+                Ok(_) => break,
+                Err(_) => {
+                    log::warn!("submission queue is full, processing completions...");
+                    let _ = self.wait_for_completion();
+                }
+            }
         }
         self.pending_ops += 1;
     }
