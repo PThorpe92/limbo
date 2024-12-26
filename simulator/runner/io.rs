@@ -69,6 +69,10 @@ impl IO for SimulatorIO {
         Ok(file)
     }
 
+    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
+        self.inner.wait_for_completion(timeout)
+    }
+
     fn run_once(&self) -> Result<()> {
         if *self.fault.borrow() {
             *self.nr_run_once_faults.borrow_mut() += 1;

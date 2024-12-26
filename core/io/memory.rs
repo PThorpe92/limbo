@@ -62,6 +62,9 @@ impl IO for Arc<MemoryIO> {
     fn get_current_time(&self) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
+    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct MemoryFile {

@@ -225,6 +225,10 @@ impl limbo_core::IO for PlatformIO {
             fd,
         }))
     }
+    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
+        // TODO
+        Ok(())
+    }
 
     fn run_once(&self) -> Result<()> {
         Ok(())

@@ -53,6 +53,9 @@ const PAGE_HEADER_OFFSET_RIGHTMOST_PTR: usize = 8;
 /// assumed that the database is corrupt.
 pub const BTCURSOR_MAX_DEPTH: usize = 20;
 
+/// arbitrary value for io timeout
+const DEFAULT_IO_TIMEOUT: i32 = 1000;
+
 /// Evaluate a Result<CursorResult<T>>, if IO return IO.
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -1848,7 +1851,7 @@ impl Cursor for BTreeCursor {
 
     fn wait_for_completion(&mut self) -> Result<()> {
         // TODO: Wait for pager I/O to complete
-        Ok(())
+        self.pager.io.wait_for_completion(DEFAULT_IO_TIMEOUT)
     }
 
     fn rowid(&self) -> Result<Option<u64>> {

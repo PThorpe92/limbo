@@ -31,16 +31,20 @@ pub trait IO {
     fn generate_random_number(&self) -> i64;
 
     fn get_current_time(&self) -> String;
+
+    fn wait_for_completion(&self, timeout: i32) -> Result<()>;
 }
 
 pub type Complete = dyn Fn(Rc<RefCell<Buffer>>);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
+pub type BatchWriteComplete = dyn Fn(i32);
 
 pub enum Completion {
     Read(ReadCompletion),
     Write(WriteCompletion),
     Sync(SyncCompletion),
+    BatchWrite(BatchWriteCompletion),
 }
 
 pub struct ReadCompletion {
@@ -51,11 +55,17 @@ pub struct ReadCompletion {
 impl Completion {
     pub fn complete(&self, result: i32) {
         match self {
-            Self::Read(r) => r.complete(),
-            Self::Write(w) => w.complete(result),
-            Self::Sync(s) => s.complete(result), // fix
+            Completion::Read(r) => r.complete(),
+            Completion::Write(w) => w.complete(result),
+            Completion::Sync(s) => s.complete(result), // fix
+            Completion::BatchWrite(b) => b.complete(result),
         }
     }
+}
+
+pub struct BatchWriteCompletion {
+    pub complete: Box<BatchWriteComplete>,
+    pub completions: Rc<Vec<(usize, Rc<Completion>)>>,
 }
 
 pub struct WriteCompletion {
@@ -81,6 +91,38 @@ impl ReadCompletion {
 
     pub fn complete(&self) {
         (self.complete)(self.buf.clone());
+    }
+}
+
+impl BatchWriteCompletion {
+    pub fn new(
+        complete: Box<BatchWriteComplete>,
+        completions: Rc<Vec<(usize, Rc<Completion>)>>,
+    ) -> Self {
+        Self {
+            complete,
+            completions,
+        }
+    }
+    pub fn complete(&self, res: i32) {
+        (self.complete)(res);
+        if res >= 0 {
+            let mut bytes_processed = 0;
+            for (len, c) in self.completions.iter() {
+                log::debug!(
+                    "Processing completion: expected {}, remaining {}",
+                    len,
+                    res - bytes_processed
+                );
+                c.complete(*len as i32);
+                bytes_processed += *len as i32;
+            }
+        } else {
+            for (_, c) in self.completions.iter() {
+                log::debug!("Error propagated to completion: {}", res);
+                c.complete(res);
+            }
+        }
     }
 }
 

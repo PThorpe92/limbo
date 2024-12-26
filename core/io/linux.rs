@@ -1,15 +1,17 @@
-use super::{common, Completion, File, OpenFlags, IO};
+use super::{common, BatchWriteCompletion, Completion, File, OpenFlags, IO};
 use crate::{LimboError, Result};
 use libc::{c_short, fcntl, flock, iovec, F_SETLK};
 use log::{debug, trace};
 use nix::fcntl::{FcntlArg, OFlag};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use thiserror::Error;
 
+const MAX_ENTRIES: u32 = 128;
+const IOV_MAX: usize = 1024;
 const MAX_IOVECS: usize = 128;
 
 #[derive(Debug, Error)]
@@ -45,11 +47,202 @@ struct InnerLinuxIO {
     ring: WrappedIOUring,
     iovecs: [iovec; MAX_IOVECS],
     next_iovec: usize,
+    // stored in PendingOps only until submission, normal unbatched ops still utilize
+    // the static iovec array, they just aren't built until submision is possible
+    pub unqueued: VecDeque<Rc<PendingOp>>,
+    batches: Batcher,
+}
+
+pub struct PendingOp {
+    opcode: OpCode,
+    completion: Rc<Completion>,
+}
+
+pub enum OpCode {
+    Read {
+        fd: i32,
+        offset: u64,
+        buf: Rc<RefCell<crate::Buffer>>,
+    },
+    Write {
+        fd: i32,
+        offset: u64,
+        buf: Rc<RefCell<crate::Buffer>>,
+    },
+    Sync {
+        fd: i32,
+    },
+    BatchWrite {
+        fd: i32,
+        offset: u64,
+        // expected bytes written, callback
+        completions: Rc<Vec<(usize, Rc<Completion>)>>,
+        // these have to live till cqe is returned
+        iovecs: Vec<libc::iovec>,
+    },
+}
+
+impl PendingOp {
+    pub fn new(opcode: OpCode, completion: Rc<Completion>) -> Self {
+        PendingOp { opcode, completion }
+    }
+}
+
+pub struct Batch {
+    fd: i32,
+    offset: u64,
+    iovecs: Vec<libc::iovec>,
+    completions: Vec<(usize, Rc<Completion>)>,
+    total_length: usize,
+    next_offset: u64,
+}
+
+struct Batcher {
+    queued: HashMap<i32, Batch>,
+    waiting_ops: VecDeque<Rc<PendingOp>>,
+    in_flight: HashMap<u64, Rc<PendingOp>>,
+}
+
+impl Batcher {
+    fn new() -> Self {
+        Self {
+            queued: HashMap::new(), // outstanding batches that can have ops added to them
+            waiting_ops: VecDeque::new(), // finalized batches that are ready to be submitted
+            in_flight: HashMap::new(), // batches that have been submitted but not yet completed
+        } // TODO: could be changed to just Vec<iovec>
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty() && self.waiting_ops.is_empty() && self.in_flight.is_empty()
+    }
+
+    #[inline(always)]
+    fn should_batch(&self, fd: i32, offset: u64) -> bool {
+        // return true if this is either the first op for this fd, or is unaligned with the batch for that fd
+        if let Some(batch) = self.queued.get(&fd) {
+            return offset == batch.next_offset;
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn flush(&mut self) -> Vec<Rc<PendingOp>> {
+        self.queued
+            .drain()
+            .map(|(_, batch)| batch.finalize().into())
+            .collect::<Vec<_>>()
+    }
+
+    // queue a write operation for batching. if the relevant batch is full,
+    // return the finalized batch to be submitted
+    fn queue_write(
+        &mut self,
+        fd: i32,
+        offset: u64,
+        buf_ptr: *const u8,
+        len: usize,
+        c: Rc<Completion>,
+    ) -> Option<Rc<PendingOp>> {
+        // check if there's an existing batch for `fd`
+        if let Some(batch) = self.queued.get_mut(&fd) {
+            // make sure it's sequential
+            if offset == batch.next_offset {
+                // append to existing batch if there's room
+                if batch.iovecs.len() < IOV_MAX {
+                    batch.push_write(offset, buf_ptr, len, c);
+                } else {
+                    // it's full, so finalize the batch and add it to 'waiting'
+                    let batch = self.queued.remove(&fd).unwrap();
+                    let finalized_op = Rc::new(batch.finalize());
+                    self.waiting_ops.push_back(finalized_op.clone());
+
+                    // start a new batch for the new offset
+                    let mut new_batch = Batch::new(fd, offset);
+                    new_batch.push_write(offset, buf_ptr, len, c);
+                    self.queued.insert(fd, new_batch);
+                    return Some(finalized_op);
+                }
+            }
+        } else {
+            log::info!("Creating new batch for fd: {:?}", fd);
+            // no existing batch => create a new one
+            let mut new_batch = Batch::new(fd, offset);
+            new_batch.push_write(offset, buf_ptr, len, c);
+            self.queued.insert(fd, new_batch);
+        }
+        None
+    }
+}
+
+impl Batch {
+    fn new(fd: i32, offset: u64) -> Self {
+        Self {
+            fd,
+            offset,
+            iovecs: Vec::new(),
+            completions: Vec::new(),
+            total_length: 0,
+            next_offset: offset,
+        }
+    }
+
+    fn push_write(&mut self, offset: u64, buf_ptr: *const u8, len: usize, c: Rc<Completion>) {
+        debug_assert!(offset == self.next_offset, "Non-sequential offset in batch");
+        debug_assert!(self.iovecs.len() < IOV_MAX, "Too many iovecs in batch");
+        self.iovecs.push(libc::iovec {
+            iov_base: buf_ptr as *mut _,
+            iov_len: len,
+        });
+        self.completions.push((len, c));
+        self.total_length += len;
+        // Move next_offset forward
+        self.next_offset = offset + len as u64;
+    }
+
+    /// convert Batch -> OpCode::BatchOp for submission
+    /// TODO: perf, partial writes, etc
+    fn finalize(self) -> PendingOp {
+        let opcode = OpCode::BatchWrite {
+            fd: self.fd,
+            offset: self.offset,
+            iovecs: self.iovecs.into_iter().collect::<Vec<_>>(),
+            completions: Rc::new(self.completions),
+        };
+        let total_length = self.total_length;
+        let completion = Box::new(move |res: i32| {
+            if res < 0 {
+                log::error!("BatchWrite failed with error: {}", res);
+            }
+            if res != total_length as i32 {
+                log::error!(
+                    "BatchWrite completed with short write: {} instead of {}",
+                    res,
+                    self.total_length
+                );
+            }
+        });
+        match opcode {
+            OpCode::BatchWrite {
+                ref completions, ..
+            } => {
+                let completions = completions.clone();
+                PendingOp::new(
+                    opcode,
+                    Rc::new(Completion::BatchWrite(BatchWriteCompletion::new(
+                        completion,
+                        completions,
+                    ))),
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl LinuxIO {
     pub fn new() -> Result<Self> {
-        let ring = io_uring::IoUring::new(MAX_IOVECS as u32)?;
+        let ring = io_uring::IoUring::new(MAX_ENTRIES)?;
         let inner = InnerLinuxIO {
             ring: WrappedIOUring {
                 ring,
@@ -62,11 +255,19 @@ impl LinuxIO {
                 iov_len: 0,
             }; MAX_IOVECS],
             next_iovec: 0,
+            unqueued: VecDeque::new(),
+            batches: Batcher::new(),
         };
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
         })
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum SqPushResult {
+    Overflowed,
+    Completed,
 }
 
 impl InnerLinuxIO {
@@ -76,6 +277,184 @@ impl InnerLinuxIO {
         iovec.iov_len = len;
         self.next_iovec = (self.next_iovec + 1) % MAX_IOVECS;
         iovec
+    }
+
+    #[inline(always)]
+    fn should_flush_batches(&mut self) -> bool {
+        !self.ring.ring.submission().is_full() && !self.batches.is_empty()
+    }
+
+    fn submit_pending(&mut self, op: OpCode, c: Rc<Completion>) -> Result<()> {
+        if !self.ring.ring.submission().is_full() {
+            // most ops will follow the easy path here of immediate submission
+            let entry = self.build_sqe(&op)?;
+            self.ring.submit_entry(&entry, c.clone());
+        } else {
+            // if sq is full, and this is a sequential write: batch it
+            if let OpCode::Write {
+                fd,
+                offset,
+                ref buf,
+            } = &op
+            {
+                if self.batches.should_batch(*fd, *offset) {
+                    let buff = buf.borrow();
+                    if let Some(ready) =
+                        self.batches
+                            .queue_write(*fd, *offset, buff.as_ptr(), buff.len(), c.clone())
+                    {
+                        // if the batch is full, push to front of waiting ops for priority
+                        self.unqueued.push_front(ready);
+                    }
+                    return Ok(());
+                }
+            }
+            {
+                // if it cannot be batched, queue it up with normal priority
+                let op = PendingOp {
+                    opcode: op,
+                    completion: c.clone(),
+                };
+                self.unqueued.push_back(Rc::new(op));
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_batches(&mut self) -> Result<SqPushResult> {
+        // finalize any outstanding batches
+        let ops = self.batches.flush();
+        self.batches.waiting_ops.extend(ops);
+        // submit all finalized batches
+        while let Some(op) = self.batches.waiting_ops.pop_front() {
+            if self.ring.ring.submission().is_full() {
+                // batched ops get priority to clear up queue, so push front
+                self.unqueued.push_front(op);
+                return Ok(SqPushResult::Overflowed);
+            } else {
+                let entry = self.build_sqe(&op.opcode)?;
+                self.ring.submit_entry(&entry, op.completion.clone());
+                self.batches
+                    .in_flight
+                    .insert(entry.get_user_data(), op.clone());
+            }
+        }
+        if self.ring.pending_ops == 0 {
+            self.batches.in_flight.clear();
+        }
+        Ok(SqPushResult::Completed)
+    }
+
+    // move operations from the unsubmitted queue to the ring, if there's room
+    fn submit_unqueued(&mut self) -> Result<SqPushResult> {
+        while let Some(op) = self.unqueued.pop_front() {
+            if self.ring.ring.submission().is_full() {
+                self.unqueued.push_front(op);
+                return Ok(SqPushResult::Overflowed);
+            }
+            let entry = self.build_sqe(&op.opcode)?;
+            self.ring.submit_entry(&entry, op.completion.clone());
+            if let OpCode::BatchWrite { .. } = op.opcode {
+                // batched ops get priority to clear up queue, so push front
+                self.batches
+                    .in_flight
+                    .insert(entry.get_user_data(), op.clone());
+            }
+        }
+        Ok(SqPushResult::Completed)
+    }
+
+    fn cycle_once(&mut self) -> Result<SqPushResult> {
+        // can hang indefinitely if this is called without checking can_wait_for_completions
+        if self.can_wait_for_completions() {
+            self.ring.wait_for_completion()?;
+            self.cycle_completions()?;
+        }
+        // check for the ideal state to submit batches
+        if self.should_flush_batches() {
+            match (self.flush_batches()?, self.submit_unqueued()?) {
+                (_, SqPushResult::Overflowed) | (SqPushResult::Overflowed, _) => {
+                    log::debug!("Overflowed, cycling completions in cycle_once");
+                }
+                _ => {}
+            }
+        }
+        self.submit_unqueued()
+    }
+
+    fn cycle_completions(&mut self) -> Result<()> {
+        while let Some(cqe) = self.ring.get_completion() {
+            let result = cqe.result();
+            if result < 0 {
+                return Err(LimboError::LinuxIOError(format!(
+                    "{} cqe: {:?}",
+                    LinuxIOError::IOUringCQError(result),
+                    cqe
+                )));
+            }
+            {
+                let c = self.ring.pending.get(&cqe.user_data()).unwrap().clone();
+                c.complete(result);
+            }
+            self.ring.pending.remove(&cqe.user_data());
+            self.batches.in_flight.remove(&cqe.user_data());
+        }
+        if self.ring.pending_ops == 0 {
+            // If no kernel ops left, in_flight is no longer relevant
+            self.batches.in_flight.clear();
+        }
+        Ok(())
+    }
+
+    // this is only called immediately before submission, when we know that there is room,
+    // to prevent overrunning iovec array with queued operations
+    fn build_sqe(&mut self, op: &OpCode) -> Result<io_uring::squeue::Entry> {
+        let key = self.ring.get_key();
+        match &op {
+            OpCode::Write { fd, offset, buf } => {
+                let buf = buf.borrow();
+                let len = buf.len();
+                Ok(io_uring::opcode::Writev::new(
+                    io_uring::types::Fd(*fd),
+                    self.get_iovec(buf.as_ptr(), len),
+                    1,
+                )
+                .offset(*offset)
+                .build()
+                .user_data(key))
+            }
+            OpCode::Read { fd, offset, buf } => {
+                let buf = buf.borrow();
+                let ptr = buf.as_ptr();
+                Ok(io_uring::opcode::Readv::new(
+                    io_uring::types::Fd(*fd),
+                    self.get_iovec(ptr, buf.len()),
+                    1,
+                )
+                .offset(*offset)
+                .build()
+                .user_data(key))
+            }
+            OpCode::Sync { fd } => Ok(io_uring::opcode::Fsync::new(io_uring::types::Fd(*fd))
+                .build()
+                .user_data(key)),
+            OpCode::BatchWrite {
+                fd, offset, iovecs, ..
+            } => Ok(io_uring::opcode::Writev::new(
+                io_uring::types::Fd(*fd),
+                iovecs.as_ptr(),
+                iovecs.len() as u32,
+            )
+            .offset(*offset)
+            .build()
+            .user_data(key)),
+        }
+    }
+    // we need to know when to avoid calling submit_and_wait
+    // to avoid hanging indefinitely.
+    #[inline(always)]
+    fn can_wait_for_completions(&self) -> bool {
+        !self.ring.empty()
     }
 }
 
@@ -109,7 +488,7 @@ impl WrappedIOUring {
     }
 
     fn empty(&self) -> bool {
-        self.pending_ops == 0
+        self.pending_ops == 0 && self.pending.is_empty()
     }
 
     fn get_key(&mut self) -> u64 {
@@ -146,29 +525,10 @@ impl IO for LinuxIO {
     }
 
     fn run_once(&self) -> Result<()> {
-        trace!("run_once()");
         let mut inner = self.inner.borrow_mut();
-        let ring = &mut inner.ring;
-
-        if ring.empty() {
-            return Ok(());
-        }
-
-        ring.wait_for_completion()?;
-        while let Some(cqe) = ring.get_completion() {
-            let result = cqe.result();
-            if result < 0 {
-                return Err(LimboError::LinuxIOError(format!(
-                    "{} cqe: {:?}",
-                    LinuxIOError::IOUringCQError(result),
-                    cqe
-                )));
-            }
-            {
-                let c = ring.pending.get(&cqe.user_data()).unwrap().clone();
-                c.complete(cqe.result());
-            }
-            ring.pending.remove(&cqe.user_data());
+        // If absolutely nothing is queued or in flight, break
+        if let Ok(SqPushResult::Overflowed) = inner.cycle_once() {
+            log::info!("Overflowed, cycling completions in run_once");
         }
         Ok(())
     }
@@ -181,6 +541,23 @@ impl IO for LinuxIO {
 
     fn get_current_time(&self) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        let start = std::time::Instant::now();
+        loop {
+            log::info!("Waiting for completion {}", start.elapsed().as_millis());
+            if start.elapsed().as_millis() as i32 >= timeout {
+                log::error!("Timeout waiting for completion {}", timeout);
+                return Err(LimboError::IOError("timeout waiting for completion".into()));
+            }
+            if inner.cycle_once()? == SqPushResult::Completed {
+                log::info!("completed cycle_once in wait_for_completion");
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -245,20 +622,14 @@ impl File for LinuxFile {
             Completion::Read(r) => r,
             _ => unreachable!(),
         };
-        trace!("pread(pos = {}, length = {})", pos, r.buf().len());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
-        let read_e = {
-            let mut buf = r.buf_mut();
-            let len = buf.len();
-            let buf = buf.as_mut_ptr();
-            let iovec = io.get_iovec(buf, len);
-            io_uring::opcode::Readv::new(fd, iovec, 1)
-                .offset(pos as u64)
-                .build()
-                .user_data(io.ring.get_key())
+        let op = OpCode::Read {
+            fd: fd.0,
+            offset: pos as u64,
+            buf: r.buf.clone(),
         };
-        io.ring.submit_entry(&read_e, c);
+        io.submit_pending(op, c.clone())?;
         Ok(())
     }
 
@@ -270,16 +641,12 @@ impl File for LinuxFile {
     ) -> Result<()> {
         let mut io = self.io.borrow_mut();
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
-        let write = {
-            let buf = buffer.borrow();
-            trace!("pwrite(pos = {}, length = {})", pos, buf.len());
-            let iovec = io.get_iovec(buf.as_ptr(), buf.len());
-            io_uring::opcode::Writev::new(fd, iovec, 1)
-                .offset(pos as u64)
-                .build()
-                .user_data(io.ring.get_key())
+        let op = OpCode::Write {
+            fd: fd.0,
+            offset: pos as u64,
+            buf: buffer.clone(),
         };
-        io.ring.submit_entry(&write, c);
+        io.submit_pending(op, c.clone())?;
         Ok(())
     }
 
@@ -287,10 +654,8 @@ impl File for LinuxFile {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let mut io = self.io.borrow_mut();
         trace!("sync()");
-        let sync = io_uring::opcode::Fsync::new(fd)
-            .build()
-            .user_data(io.ring.get_key());
-        io.ring.submit_entry(&sync, c);
+        let op = OpCode::Sync { fd: fd.0 };
+        io.submit_pending(op, c.clone())?;
         Ok(())
     }
 
