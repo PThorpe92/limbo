@@ -56,7 +56,10 @@ impl IO for DarwinIO {
         loop {
             if timeout > 0 && start.elapsed().as_millis() as i32 >= timeout {
                 log::error!("timeout waiting for completion after {} ms", timeout);
-                return Err(LimboError::IOError("timeout waiting for completion".into()));
+                return Err(LimboError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timeout waiting for completion",
+                )));
             }
             let elapsed = start.elapsed().as_millis() as i32;
             let remaining_timeout = if timeout > 0 {
@@ -70,7 +73,7 @@ impl IO for DarwinIO {
             match poller.wait(
                 &mut events,
                 if remaining_timeout > 0 {
-                    Some(remaining_timeout as u64)
+                    Some(std::time::Duration::from_millis(remaining_timeout as u64))
                 } else {
                     None
                 },

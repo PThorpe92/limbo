@@ -550,7 +550,9 @@ impl IO for LinuxIO {
             log::info!("Waiting for completion {}", start.elapsed().as_millis());
             if start.elapsed().as_millis() as i32 >= timeout {
                 log::error!("Timeout waiting for completion {}", timeout);
-                return Err(LimboError::IOError("timeout waiting for completion".into()));
+                return Err(LimboError::LinuxIOError(
+                    "timeout waiting for completion".into(),
+                ));
             }
             if inner.cycle_once()? == SqPushResult::Completed {
                 log::info!("completed cycle_once in wait_for_completion");
