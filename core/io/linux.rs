@@ -98,18 +98,18 @@ pub struct Batch {
 }
 
 struct Batcher {
-    queued: HashMap<i32, Batch>,
-    waiting_ops: VecDeque<Rc<PendingOp>>,
-    in_flight: HashMap<u64, Rc<PendingOp>>,
+    queued: HashMap<i32, Batch>, // outstanding batches that can have ops added to them
+    waiting_ops: VecDeque<Rc<PendingOp>>, // finalized batches that are ready to be submitted
+    in_flight: HashMap<u64, Rc<PendingOp>>, // batches that have been submitted but not yet completed
 }
 
 impl Batcher {
     fn new() -> Self {
         Self {
-            queued: HashMap::new(), // outstanding batches that can have ops added to them
-            waiting_ops: VecDeque::new(), // finalized batches that are ready to be submitted
-            in_flight: HashMap::new(), // batches that have been submitted but not yet completed
-        } // TODO: could be changed to just Vec<iovec>
+            queued: HashMap::new(),
+            waiting_ops: VecDeque::new(),
+            in_flight: HashMap::new(), // TODO: could be changed to just Vec<iovec>
+        }
     }
 
     #[inline(always)]
@@ -119,7 +119,6 @@ impl Batcher {
 
     #[inline(always)]
     fn should_batch(&self, fd: i32, offset: u64) -> bool {
-        // return true if this is either the first op for this fd, or is unaligned with the batch for that fd
         if let Some(batch) = self.queued.get(&fd) {
             return offset == batch.next_offset;
         }
@@ -143,8 +142,7 @@ impl Batcher {
         buf_ptr: *const u8,
         len: usize,
         c: Rc<Completion>,
-    ) -> Option<Rc<PendingOp>> {
-        // check if there's an existing batch for `fd`
+    ) {
         if let Some(batch) = self.queued.get_mut(&fd) {
             // make sure it's sequential
             if offset == batch.next_offset {
@@ -152,26 +150,27 @@ impl Batcher {
                 if batch.iovecs.len() < IOV_MAX {
                     batch.push_write(offset, buf_ptr, len, c);
                 } else {
+                    log::info!("Batch is full for fd: {:?}", fd);
                     // it's full, so finalize the batch and add it to 'waiting'
-                    let batch = self.queued.remove(&fd).unwrap();
-                    let finalized_op = Rc::new(batch.finalize());
+                    let full = self.queued.remove(&fd).unwrap();
+                    let finalized_op = Rc::new(full.finalize());
                     self.waiting_ops.push_back(finalized_op.clone());
 
                     // start a new batch for the new offset
-                    let mut new_batch = Batch::new(fd, offset);
+                    let random_id = rand::random::<i32>();
+                    let mut new_batch = Batch::new(fd, random_id, offset);
                     new_batch.push_write(offset, buf_ptr, len, c);
                     self.queued.insert(fd, new_batch);
-                    return Some(finalized_op);
                 }
             }
         } else {
             log::info!("Creating new batch for fd: {:?}", fd);
             // no existing batch => create a new one
-            let mut new_batch = Batch::new(fd, offset);
+            let random_id = rand::random::<i32>();
+            let mut new_batch = Batch::new(fd, random_id, offset);
             new_batch.push_write(offset, buf_ptr, len, c);
             self.queued.insert(fd, new_batch);
         }
-        None
     }
 }
 
@@ -201,7 +200,7 @@ impl Batch {
     }
 
     /// convert Batch -> OpCode::BatchOp for submission
-    /// TODO: perf, partial writes, etc
+    /// TODO: perf, handle partial writes
     fn finalize(self) -> PendingOp {
         let opcode = OpCode::BatchWrite {
             fd: self.fd,
@@ -209,19 +208,6 @@ impl Batch {
             iovecs: self.iovecs.into_iter().collect::<Vec<_>>(),
             completions: Rc::new(self.completions),
         };
-        let total_length = self.total_length;
-        let completion = Box::new(move |res: i32| {
-            if res < 0 {
-                log::error!("BatchWrite failed with error: {}", res);
-            }
-            if res != total_length as i32 {
-                log::error!(
-                    "BatchWrite completed with short write: {} instead of {}",
-                    res,
-                    self.total_length
-                );
-            }
-        });
         match opcode {
             OpCode::BatchWrite {
                 ref completions, ..
@@ -230,7 +216,6 @@ impl Batch {
                 PendingOp::new(
                     opcode,
                     Rc::new(Completion::BatchWrite(BatchWriteCompletion::new(
-                        completion,
                         completions,
                     ))),
                 )
@@ -299,37 +284,28 @@ impl InnerLinuxIO {
             {
                 if self.batches.should_batch(*fd, *offset) {
                     let buff = buf.borrow();
-                    if let Some(ready) =
-                        self.batches
-                            .queue_write(*fd, *offset, buff.as_ptr(), buff.len(), c.clone())
-                    {
-                        // if the batch is full, push to front of waiting ops for priority
-                        self.unqueued.push_front(ready);
-                    }
+                    self.batches
+                        .queue_write(*fd, *offset, buff.as_ptr(), buff.len(), c.clone());
                     return Ok(());
                 }
             }
-            {
-                // if it cannot be batched, queue it up with normal priority
-                let op = PendingOp {
-                    opcode: op,
-                    completion: c.clone(),
-                };
-                self.unqueued.push_back(Rc::new(op));
-            }
+            // if it cannot be batched, queue it up with normal priority
+            let op = PendingOp {
+                opcode: op,
+                completion: c.clone(),
+            };
+            self.unqueued.push_back(Rc::new(op));
         }
         Ok(())
     }
 
     fn flush_batches(&mut self) -> Result<SqPushResult> {
-        // finalize any outstanding batches
         let ops = self.batches.flush();
         self.batches.waiting_ops.extend(ops);
         // submit all finalized batches
         while let Some(op) = self.batches.waiting_ops.pop_front() {
             if self.ring.ring.submission().is_full() {
-                // batched ops get priority to clear up queue, so push front
-                self.unqueued.push_front(op);
+                self.batches.waiting_ops.push_front(op);
                 return Ok(SqPushResult::Overflowed);
             } else {
                 let entry = self.build_sqe(&op.opcode)?;
@@ -370,14 +346,8 @@ impl InnerLinuxIO {
             self.ring.wait_for_completion()?;
             self.cycle_completions()?;
         }
-        // check for the ideal state to submit batches
         if self.should_flush_batches() {
-            match (self.flush_batches()?, self.submit_unqueued()?) {
-                (_, SqPushResult::Overflowed) | (SqPushResult::Overflowed, _) => {
-                    log::debug!("Overflowed, cycling completions in cycle_once");
-                }
-                _ => {}
-            }
+            self.flush_batches()?;
         }
         self.submit_unqueued()
     }
@@ -450,8 +420,7 @@ impl InnerLinuxIO {
             .user_data(key)),
         }
     }
-    // we need to know when to avoid calling submit_and_wait
-    // to avoid hanging indefinitely.
+
     #[inline(always)]
     fn can_wait_for_completions(&self) -> bool {
         !self.ring.empty()
@@ -526,10 +495,7 @@ impl IO for LinuxIO {
 
     fn run_once(&self) -> Result<()> {
         let mut inner = self.inner.borrow_mut();
-        // If absolutely nothing is queued or in flight, break
-        if let Ok(SqPushResult::Overflowed) = inner.cycle_once() {
-            log::info!("Overflowed, cycling completions in run_once");
-        }
+        let _ = inner.cycle_once()?;
         Ok(())
     }
 
@@ -543,11 +509,13 @@ impl IO for LinuxIO {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
+    // TODO: since this is essentially run_once in a loop with a timeout,
+    // probably no need to add a new trait method for this.
     fn wait_for_completion(&self, timeout: i32) -> Result<()> {
         let mut inner = self.inner.borrow_mut();
         let start = std::time::Instant::now();
         loop {
-            log::info!("Waiting for completion {}", start.elapsed().as_millis());
+            log::trace!("pending_ops: {}, batches_queued: {}, batches_in_flight: {}, batches_waiting: {}, unqueued: {}", inner.ring.pending_ops, inner.batches.queued.len(), inner.batches.in_flight.len(), inner.batches.waiting_ops.len(), inner.unqueued.len());
             if start.elapsed().as_millis() as i32 >= timeout {
                 log::error!("Timeout waiting for completion {}", timeout);
                 return Err(LimboError::LinuxIOError(
@@ -555,7 +523,6 @@ impl IO for LinuxIO {
                 ));
             }
             if inner.cycle_once()? == SqPushResult::Completed {
-                log::info!("completed cycle_once in wait_for_completion");
                 break;
             }
         }

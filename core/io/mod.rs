@@ -38,7 +38,6 @@ pub trait IO {
 pub type Complete = dyn Fn(Rc<RefCell<Buffer>>);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
-pub type BatchWriteComplete = dyn Fn(i32);
 
 pub enum Completion {
     Read(ReadCompletion),
@@ -64,7 +63,6 @@ impl Completion {
 }
 
 pub struct BatchWriteCompletion {
-    pub complete: Box<BatchWriteComplete>,
     pub completions: Rc<Vec<(usize, Rc<Completion>)>>,
 }
 
@@ -95,17 +93,10 @@ impl ReadCompletion {
 }
 
 impl BatchWriteCompletion {
-    pub fn new(
-        complete: Box<BatchWriteComplete>,
-        completions: Rc<Vec<(usize, Rc<Completion>)>>,
-    ) -> Self {
-        Self {
-            complete,
-            completions,
-        }
+    pub fn new(completions: Rc<Vec<(usize, Rc<Completion>)>>) -> Self {
+        Self { completions }
     }
     pub fn complete(&self, res: i32) {
-        (self.complete)(res);
         if res >= 0 {
             let mut bytes_processed = 0;
             for (len, c) in self.completions.iter() {
