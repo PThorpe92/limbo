@@ -29,7 +29,7 @@ impl IO for WindowsIO {
         Ok(())
     }
 
-    fn wait_for_completion(&self) -> Result<()> {
+    fn wait_for_completion(&self, _timeout: i32) -> Result<()> {
         Ok(())
     }
 

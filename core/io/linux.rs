@@ -108,7 +108,7 @@ impl Batcher {
         Self {
             queued: HashMap::new(),
             waiting_ops: VecDeque::new(),
-            in_flight: HashMap::new(), // TODO: could be changed to just Vec<iovec>
+            in_flight: HashMap::new(),
         }
     }
 
@@ -144,7 +144,6 @@ impl Batcher {
         c: Rc<Completion>,
     ) {
         if let Some(batch) = self.queued.get_mut(&fd) {
-            // make sure it's sequential
             if offset == batch.next_offset {
                 // append to existing batch if there's room
                 if batch.iovecs.len() < IOV_MAX {
@@ -157,8 +156,7 @@ impl Batcher {
                     self.waiting_ops.push_back(finalized_op.clone());
 
                     // start a new batch for the new offset
-                    let random_id = rand::random::<i32>();
-                    let mut new_batch = Batch::new(fd, random_id, offset);
+                    let mut new_batch = Batch::new(fd, offset);
                     new_batch.push_write(offset, buf_ptr, len, c);
                     self.queued.insert(fd, new_batch);
                 }
@@ -166,8 +164,7 @@ impl Batcher {
         } else {
             log::info!("Creating new batch for fd: {:?}", fd);
             // no existing batch => create a new one
-            let random_id = rand::random::<i32>();
-            let mut new_batch = Batch::new(fd, random_id, offset);
+            let mut new_batch = Batch::new(fd, offset);
             new_batch.push_write(offset, buf_ptr, len, c);
             self.queued.insert(fd, new_batch);
         }
@@ -509,13 +506,10 @@ impl IO for LinuxIO {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
-    // TODO: since this is essentially run_once in a loop with a timeout,
-    // probably no need to add a new trait method for this.
     fn wait_for_completion(&self, timeout: i32) -> Result<()> {
         let mut inner = self.inner.borrow_mut();
         let start = std::time::Instant::now();
         loop {
-            log::trace!("pending_ops: {}, batches_queued: {}, batches_in_flight: {}, batches_waiting: {}, unqueued: {}", inner.ring.pending_ops, inner.batches.queued.len(), inner.batches.in_flight.len(), inner.batches.waiting_ops.len(), inner.unqueued.len());
             if start.elapsed().as_millis() as i32 >= timeout {
                 log::error!("Timeout waiting for completion {}", timeout);
                 return Err(LimboError::LinuxIOError(
