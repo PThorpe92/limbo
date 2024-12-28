@@ -1,12 +1,13 @@
 use log::debug;
 
+use crate::io::IOStatus;
 use crate::storage::pager::Pager;
 use crate::storage::sqlite3_ondisk::{
     read_btree_cell, read_varint, write_varint, BTreeCell, DatabaseHeader, PageContent, PageType,
     TableInteriorCell, TableLeafCell,
 };
 use crate::types::{Cursor, CursorResult, OwnedRecord, OwnedValue, SeekKey, SeekOp};
-use crate::Result;
+use crate::{LimboError, Result};
 
 use std::cell::{Ref, RefCell};
 use std::pin::Pin;
@@ -1850,8 +1851,19 @@ impl Cursor for BTreeCursor {
     }
 
     fn wait_for_completion(&mut self) -> Result<()> {
-        // TODO: Wait for pager I/O to complete
-        self.pager.io.wait_for_completion(DEFAULT_IO_TIMEOUT)
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed().as_millis() as i32 >= DEFAULT_IO_TIMEOUT {
+                return Err(LimboError::IOError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timeout waiting for completion",
+                )));
+            }
+            if self.pager.io.run_once()? == IOStatus::Completed {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn rowid(&self) -> Result<Option<u64>> {

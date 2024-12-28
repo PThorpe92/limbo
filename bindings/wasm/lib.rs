@@ -1,5 +1,6 @@
 use limbo_core::{
-    maybe_init_database_file, BufferPool, OpenFlags, Pager, Result, WalFile, WalFileShared,
+    maybe_init_database_file, BufferPool, IOStatus, OpenFlags, Pager, Result, WalFile,
+    WalFileShared,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -225,13 +226,9 @@ impl limbo_core::IO for PlatformIO {
             fd,
         }))
     }
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        // TODO
-        Ok(())
-    }
 
-    fn run_once(&self) -> Result<()> {
-        Ok(())
+    fn run_once(&self) -> Result<IOStatus> {
+        Ok(IOStatus::Completed)
     }
 
     fn generate_random_number(&self) -> i64 {

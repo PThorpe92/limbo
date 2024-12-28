@@ -1,4 +1,4 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Completion, File, IOStatus, OpenFlags, IO};
 use crate::Result;
 
 use std::{
@@ -48,9 +48,8 @@ impl IO for Arc<MemoryIO> {
         }))
     }
 
-    fn run_once(&self) -> Result<()> {
-        // nop
-        Ok(())
+    fn run_once(&self) -> Result<IOStatus> {
+        Ok(IOStatus::Completed)
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -61,9 +60,6 @@ impl IO for Arc<MemoryIO> {
 
     fn get_current_time(&self) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    }
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        Ok(())
     }
 }
 

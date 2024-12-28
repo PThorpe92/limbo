@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use limbo_core::{OpenFlags, PlatformIO, Result, IO};
+use limbo_core::{IOStatus, OpenFlags, PlatformIO, Result, IO};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -69,19 +69,14 @@ impl IO for SimulatorIO {
         Ok(file)
     }
 
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        self.inner.wait_for_completion(timeout)
-    }
-
-    fn run_once(&self) -> Result<()> {
+    fn run_once(&self) -> Result<IOStatus> {
         if *self.fault.borrow() {
             *self.nr_run_once_faults.borrow_mut() += 1;
             return Err(limbo_core::LimboError::InternalError(
                 "Injected fault".into(),
             ));
         }
-        self.inner.run_once().unwrap();
-        Ok(())
+        self.inner.run_once()
     }
 
     fn generate_random_number(&self) -> i64 {

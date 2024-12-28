@@ -45,7 +45,7 @@ use crate::translate::optimizer::optimize_plan;
 pub use io::OpenFlags;
 #[cfg(feature = "fs")]
 pub use io::PlatformIO;
-pub use io::{Buffer, Completion, File, MemoryIO, WriteCompletion, IO};
+pub use io::{Buffer, Completion, File, IOStatus, MemoryIO, WriteCompletion, IO};
 pub use storage::buffer_pool::BufferPool;
 pub use storage::database::DatabaseStorage;
 pub use storage::pager::Page;

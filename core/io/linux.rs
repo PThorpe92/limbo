@@ -1,4 +1,4 @@
-use super::{common, BatchWriteCompletion, Completion, File, OpenFlags, IO};
+use super::{common, BatchWriteCompletion, Completion, File, IOStatus, OpenFlags, IO};
 use crate::{LimboError, Result};
 use libc::{c_short, fcntl, flock, iovec, F_SETLK};
 use log::{debug, trace};
@@ -246,12 +246,6 @@ impl LinuxIO {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum SqPushResult {
-    Overflowed,
-    Completed,
-}
-
 impl InnerLinuxIO {
     pub fn get_iovec(&mut self, buf: *const u8, len: usize) -> &iovec {
         let iovec = &mut self.iovecs[self.next_iovec];
@@ -259,6 +253,12 @@ impl InnerLinuxIO {
         iovec.iov_len = len;
         self.next_iovec = (self.next_iovec + 1) % MAX_IOVECS;
         iovec
+    }
+
+    #[inline(always)]
+    fn remove_completed(&mut self, user_data: u64) {
+        self.ring.pending.remove(&user_data);
+        self.batches.in_flight.remove(&user_data);
     }
 
     #[inline(always)]
@@ -296,14 +296,14 @@ impl InnerLinuxIO {
         Ok(())
     }
 
-    fn flush_batches(&mut self) -> Result<SqPushResult> {
+    fn flush_batches(&mut self) -> Result<IOStatus> {
         let ops = self.batches.flush();
         self.batches.waiting_ops.extend(ops);
         // submit all finalized batches
         while let Some(op) = self.batches.waiting_ops.pop_front() {
             if self.ring.ring.submission().is_full() {
                 self.batches.waiting_ops.push_front(op);
-                return Ok(SqPushResult::Overflowed);
+                return Ok(IOStatus::HasPending);
             } else {
                 let entry = self.build_sqe(&op.opcode)?;
                 self.ring.submit_entry(&entry, op.completion.clone());
@@ -312,18 +312,15 @@ impl InnerLinuxIO {
                     .insert(entry.get_user_data(), op.clone());
             }
         }
-        if self.ring.pending_ops == 0 {
-            self.batches.in_flight.clear();
-        }
-        Ok(SqPushResult::Completed)
+        Ok(IOStatus::Completed)
     }
 
     // move operations from the unsubmitted queue to the ring, if there's room
-    fn submit_unqueued(&mut self) -> Result<SqPushResult> {
+    fn submit_unqueued(&mut self) -> Result<IOStatus> {
         while let Some(op) = self.unqueued.pop_front() {
             if self.ring.ring.submission().is_full() {
                 self.unqueued.push_front(op);
-                return Ok(SqPushResult::Overflowed);
+                return Ok(IOStatus::HasPending);
             }
             let entry = self.build_sqe(&op.opcode)?;
             self.ring.submit_entry(&entry, op.completion.clone());
@@ -334,17 +331,17 @@ impl InnerLinuxIO {
                     .insert(entry.get_user_data(), op.clone());
             }
         }
-        Ok(SqPushResult::Completed)
+        Ok(IOStatus::Completed)
     }
 
-    fn cycle_once(&mut self) -> Result<SqPushResult> {
+    fn cycle_once(&mut self) -> Result<IOStatus> {
         // can hang indefinitely if this is called without checking can_wait_for_completions
         if self.can_wait_for_completions() {
             self.ring.wait_for_completion()?;
             self.cycle_completions()?;
         }
-        if self.should_flush_batches() {
-            self.flush_batches()?;
+        if self.should_flush_batches() && matches!(self.flush_batches()?, IOStatus::HasPending) {
+            return Ok(IOStatus::HasPending);
         }
         self.submit_unqueued()
     }
@@ -359,16 +356,17 @@ impl InnerLinuxIO {
                     cqe
                 )));
             }
+            let user_data = cqe.user_data();
             {
-                let c = self.ring.pending.get(&cqe.user_data()).unwrap().clone();
+                let c = self
+                    .ring
+                    .pending
+                    .get(&user_data)
+                    .expect("submissions were inserted")
+                    .clone();
                 c.complete(result);
             }
-            self.ring.pending.remove(&cqe.user_data());
-            self.batches.in_flight.remove(&cqe.user_data());
-        }
-        if self.ring.pending_ops == 0 {
-            // If no kernel ops left, in_flight is no longer relevant
-            self.batches.in_flight.clear();
+            self.remove_completed(user_data);
         }
         Ok(())
     }
@@ -490,10 +488,9 @@ impl IO for LinuxIO {
         Ok(linux_file)
     }
 
-    fn run_once(&self) -> Result<()> {
+    fn run_once(&self) -> Result<IOStatus> {
         let mut inner = self.inner.borrow_mut();
-        let _ = inner.cycle_once()?;
-        Ok(())
+        inner.cycle_once()
     }
 
     fn generate_random_number(&self) -> i64 {
@@ -504,23 +501,6 @@ impl IO for LinuxIO {
 
     fn get_current_time(&self) -> String {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    }
-
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        let mut inner = self.inner.borrow_mut();
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed().as_millis() as i32 >= timeout {
-                log::error!("Timeout waiting for completion {}", timeout);
-                return Err(LimboError::LinuxIOError(
-                    "timeout waiting for completion".into(),
-                ));
-            }
-            if inner.cycle_once()? == SqPushResult::Completed {
-                break;
-            }
-        }
-        Ok(())
     }
 }
 

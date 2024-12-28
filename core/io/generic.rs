@@ -1,4 +1,4 @@
-use crate::{Completion, File, LimboError, OpenFlags, Result, IO};
+use crate::{Completion, File, IOStatus, LimboError, OpenFlags, Result, IO};
 use log::trace;
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
@@ -25,18 +25,14 @@ impl IO for GenericIO {
         }))
     }
 
-    fn run_once(&self) -> Result<()> {
-        Ok(())
+    fn run_once(&self) -> Result<IOStatus> {
+        Ok(IOStatus::Completed)
     }
 
     fn generate_random_number(&self) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
-    }
-
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        Ok(())
     }
 
     fn get_current_time(&self) -> String {

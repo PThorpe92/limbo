@@ -9,6 +9,12 @@ use std::{
     rc::Rc,
 };
 
+#[derive(Debug, PartialEq)]
+pub enum IOStatus {
+    HasPending,
+    Completed,
+}
+
 pub trait File {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
@@ -26,13 +32,11 @@ pub enum OpenFlags {
 pub trait IO {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Rc<dyn File>>;
 
-    fn run_once(&self) -> Result<()>;
+    fn run_once(&self) -> Result<IOStatus>;
 
     fn generate_random_number(&self) -> i64;
 
     fn get_current_time(&self) -> String;
-
-    fn wait_for_completion(&self, timeout: i32) -> Result<()>;
 }
 
 pub type Complete = dyn Fn(Rc<RefCell<Buffer>>);

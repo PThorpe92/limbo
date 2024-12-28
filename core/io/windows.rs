@@ -1,4 +1,4 @@
-use crate::{Completion, File, LimboError, OpenFlags, Result, WriteCompletion, IO};
+use crate::{Completion, File, IOStatus, LimboError, OpenFlags, Result, WriteCompletion, IO};
 use log::trace;
 use std::cell::RefCell;
 use std::io::{Read, Seek, Write};
@@ -25,12 +25,8 @@ impl IO for WindowsIO {
         }))
     }
 
-    fn run_once(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn wait_for_completion(&self, _timeout: i32) -> Result<()> {
-        Ok(())
+    fn run_once(&self) -> Result<IOStatus> {
+        Ok(IOStatus::Completed)
     }
 
     fn generate_random_number(&self) -> i64 {

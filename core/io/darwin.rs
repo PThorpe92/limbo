@@ -1,8 +1,8 @@
+use super::IOStatus;
+use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
 use crate::io::common;
 use crate::Result;
-
-use super::{Completion, File, OpenFlags, IO};
 use libc::{c_short, fcntl, flock, F_SETLK};
 use log::trace;
 use polling::{Event, Events, Poller};
@@ -51,92 +51,9 @@ impl IO for DarwinIO {
         Ok(darwin_file)
     }
 
-    fn wait_for_completion(&self, timeout: i32) -> Result<()> {
-        let start = std::time::Instant::now();
-        loop {
-            if timeout > 0 && start.elapsed().as_millis() as i32 >= timeout {
-                log::error!("timeout waiting for completion after {} ms", timeout);
-                return Err(LimboError::IOError(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timeout waiting for completion",
-                )));
-            }
-            let elapsed = start.elapsed().as_millis() as i32;
-            let remaining_timeout = if timeout > 0 {
-                std::cmp::max(0, timeout - elapsed)
-            } else {
-                -1 // no timeout, wait indefinitely/sync
-            };
-            let mut events = self.events.borrow_mut();
-            events.clear();
-            let poller = self.poller.borrow();
-            match poller.wait(
-                &mut events,
-                if remaining_timeout > 0 {
-                    Some(std::time::Duration::from_millis(remaining_timeout as u64))
-                } else {
-                    None
-                },
-            ) {
-                Ok(_) => (),
-                Err(e) => {
-                    log::error!("Polling failed: {:?}", e);
-                    return Err(e.into());
-                }
-            }
-            let mut callbacks = self.callbacks.borrow_mut();
-            for event in events.iter() {
-                if let Some(callback) = callbacks.remove(&event.key) {
-                    match callback {
-                        CompletionCallback::Read(file, completion, pos) => {
-                            let result = {
-                                let mut file = file.borrow_mut();
-                                let c: &Completion = &completion;
-                                let r = match c {
-                                    Completion::Read(r) => r,
-                                    _ => unreachable!(),
-                                };
-                                let mut buf = r.buf_mut();
-                                file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                                file.read(buf.as_mut_slice())
-                            };
-                            match result {
-                                Ok(n) => completion.complete(n as i32),
-                                Err(e) => {
-                                    log::error!("Read failed: {:?}", e);
-                                    return Err(e.into());
-                                }
-                            }
-                        }
-                        CompletionCallback::Write(file, completion, buffer, pos) => {
-                            let result = {
-                                let mut file = file.borrow_mut();
-                                let buf = buffer.borrow();
-                                file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                                file.write(buf.as_slice())
-                            };
-                            match result {
-                                Ok(n) => completion.complete(n as i32),
-                                Err(e) => {
-                                    log::error!("Write failed: {:?}", e);
-                                    return Err(e.into());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if callbacks.is_empty() {
-                log::info!("All callbacks completed.");
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn run_once(&self) -> Result<()> {
+    fn run_once(&self) -> Result<IOStatus> {
         if self.callbacks.borrow().is_empty() {
-            return Ok(());
+            return Ok(IOStatus::Completed);
         }
         let mut events = self.events.borrow_mut();
         events.clear();
@@ -178,7 +95,10 @@ impl IO for DarwinIO {
                                 c.complete(n as i32);
                             }
                         }
-                        return Ok(());
+                        return Ok(match self.callbacks.borrow().len() {
+                            0 => IOStatus::Completed,
+                            _ => IOStatus::HasPending,
+                        });
                     }
                     Err(e) => {
                         return Err(e.into());
@@ -186,7 +106,7 @@ impl IO for DarwinIO {
                 }
             }
         }
-        Ok(())
+        Ok(IOStatus::Completed)
     }
 
     fn generate_random_number(&self) -> i64 {
