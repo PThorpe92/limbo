@@ -55,7 +55,7 @@ const PAGE_HEADER_OFFSET_RIGHTMOST_PTR: usize = 8;
 pub const BTCURSOR_MAX_DEPTH: usize = 20;
 
 /// arbitrary value for io timeout
-const DEFAULT_IO_TIMEOUT: i32 = 1000;
+const DEFAULT_IO_TIMEOUT: i64 = 1000;
 
 /// Evaluate a Result<CursorResult<T>>, if IO return IO.
 macro_rules! return_if_io {
@@ -1851,9 +1851,16 @@ impl Cursor for BTreeCursor {
     }
 
     fn wait_for_completion(&mut self) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = chrono::DateTime::parse_from_rfc3339(self.pager.io.get_current_time().as_str())
+            .unwrap_or_default()
+            .timestamp_millis();
         loop {
-            if start.elapsed().as_millis() as i32 >= DEFAULT_IO_TIMEOUT {
+            if chrono::DateTime::parse_from_rfc3339(self.pager.io.get_current_time().as_str())
+                .unwrap_or_default()
+                .timestamp_millis()
+                - start
+                >= DEFAULT_IO_TIMEOUT
+            {
                 return Err(LimboError::IOError(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "timeout waiting for completion",
