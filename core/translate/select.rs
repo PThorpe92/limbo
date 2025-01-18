@@ -163,9 +163,7 @@ pub fn prepare_select_plan(
                                         });
                                     }
                                     Err(e) => {
-                                        if e.to_string().starts_with("no such function: ")
-                                            && let Some(f) =
-                                                syms.resolve_function(&name.0, args_count)
+                                        if let Some(f) = syms.resolve_function(&name.0, args_count)
                                         {
                                             if let ExtFunc::Scalar(_) = f.as_ref().func {
                                                 let contains_aggregates = resolve_aggregates(
@@ -201,8 +199,9 @@ pub fn prepare_select_plan(
                                                 });
                                             }
                                             continue; // Continue with the normal flow instead of returning
+                                        } else {
+                                            return Err(e);
                                         }
-                                        return Err(e); // propogate the original error
                                     }
                                 }
                             }

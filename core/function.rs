@@ -143,6 +143,7 @@ impl AggFunc {
             Self::StringAgg => 2,
             Self::Sum => 1,
             Self::Total => 1,
+            Self::External(func) => func.agg_args().unwrap_or(0),
         }
     }
 
