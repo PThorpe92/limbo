@@ -32,3 +32,4 @@ miette = { version = "7.4.0", features = ["fancy"] }
 
 [features]
 io_uring = ["limbo_core/io_uring"]
+defaults = ["io_uring"]
