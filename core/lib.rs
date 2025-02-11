@@ -28,7 +28,7 @@ use fallible_iterator::FallibleIterator;
 use libloading::{Library, Symbol};
 #[cfg(not(target_family = "wasm"))]
 use limbo_ext::{ExtensionApi, ExtensionEntryPoint};
-use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl, Value as ExtValue};
+use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl, Value as ExtValue, VfsImpl};
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::{Column, Schema};
@@ -434,7 +434,6 @@ impl Connection {
                 schema: db.schema.clone(),
                 header: db.header.clone(),
                 syms: self.db.syms.clone(),
-                vtab_modules: self.db.vtab_modules.clone(),
                 _shared_page_cache: db._shared_page_cache.clone(),
                 _shared_wal: db._shared_wal.clone(),
             }
