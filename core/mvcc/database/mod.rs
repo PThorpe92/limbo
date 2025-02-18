@@ -787,7 +787,6 @@ pub(crate) fn is_write_write_conflict(
 }
 
 impl RowVersion {
-impl<T> RowVersion<T> {
     pub fn is_visible_to(
         &self,
         tx: &Transaction,
