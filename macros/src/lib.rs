@@ -720,7 +720,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
             let vfs_instance = &*(vfs_file.vfs as *const #struct_name);
 
             // this time we need to own it so we can drop it
-            let file: Box<<#struct_name as ::limbo_ext::VfsExtension>::File> =
+            let file: ::std::boxed::Box<<#struct_name as ::limbo_ext::VfsExtension>::File> =
              ::std::boxed::Box::from_raw(vfs_file.file as *mut <#struct_name as ::limbo_ext::VfsExtension>::File);
             if let Err(e) = <#struct_name as ::limbo_ext::VfsExtension>::close(vfs_instance, *file) {
                 return e;
@@ -957,6 +957,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 
                 #(#static_vtabs)*
 
+                #[cfg(not(target_family = "wasm"))]
                 #(#static_vfs)*
 
                 ::limbo_ext::ResultCode::OK
@@ -971,6 +972,7 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 
                 #(#vtab_calls)*
 
+                #[cfg(not(target_family = "wasm"))]
                 #(#vfs_calls)*
 
                 ::limbo_ext::ResultCode::OK
