@@ -1,3 +1,4 @@
+mod vtab_queries;
 use crate::{function::ExternalFunc, Database};
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl,

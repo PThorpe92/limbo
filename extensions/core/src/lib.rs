@@ -1,19 +1,31 @@
 mod types;
+mod vtab_connect;
 pub use limbo_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive};
 use std::{
     fmt::Display,
     os::raw::{c_char, c_void},
 };
 pub use types::{ResultCode, Value, ValueType};
+pub use vtab_connect::{ConnectFn, Connection, Stmt};
 
 pub type ExtResult<T> = std::result::Result<T, ResultCode>;
 
 #[repr(C)]
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
+    pub conn: *const Connection,
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
+    pub connect: ConnectFn,
+}
+
+impl ExtensionApi {
+    pub fn connect(&mut self) -> &Connection {
+        let connection = unsafe { (self.connect)(self.ctx) };
+        self.conn = connection;
+        unsafe { &(*self.conn) }
+    }
 }
 
 pub type ExtensionEntryPoint = unsafe extern "C" fn(api: *const ExtensionApi) -> ResultCode;
@@ -123,6 +135,7 @@ pub trait VTabModule: 'static {
     type Error: std::fmt::Display;
 
     fn create_schema(args: &[Value]) -> String;
+    fn connect(&self) -> Connection;
     fn open(&self) -> Result<Self::VCursor, Self::Error>;
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode;
     fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
