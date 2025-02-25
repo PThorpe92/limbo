@@ -1674,15 +1674,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "limbo_kv"
-version = "0.0.15"
-dependencies = [
- "lazy_static",
- "limbo_ext",
- "mimalloc",
-]
-
-[[package]]
 name = "limbo_macros"
 version = "0.0.15"
 dependencies = [
@@ -1774,6 +1765,7 @@ version = "0.0.15"
 dependencies = [
  "chrono",
  "getrandom 0.3.1",
+ "lazy_static",
  "limbo_ext",
  "mimalloc",
 ]

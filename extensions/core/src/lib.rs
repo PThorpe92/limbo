@@ -2,11 +2,21 @@ mod functions;
 mod types;
 mod vfs;
 mod vtabs;
-use functions::{RegisterAggFn, RegisterModuleFn, RegisterScalarFn};
+pub use functions::{
+    AggCtx, AggFunc, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
+};
+use functions::{RegisterAggFn, RegisterScalarFn};
 pub use limbo_macros::{register_extension, scalar, AggregateDerive, VTabModuleDerive, VfsDerive};
 use std::ffi::c_void;
 pub use types::{ResultCode, Value, ValueType};
-use vfs::{RegisterVfsFn, VfsImpl};
+pub use vfs::{
+    RegisterVfsFn, VfsClose, VfsExtension, VfsFile, VfsFileImpl, VfsGenerateRandomNumber,
+    VfsGetCurrentTime, VfsImpl, VfsLock, VfsOpen, VfsRead, VfsRunOnce, VfsSize, VfsSync, VfsWrite,
+};
+pub use vtabs::{
+    RegisterModuleFn, VTabCursor, VTabFnColumn, VTabFnCreateSchema, VTabFnEof, VTabFnFilter,
+    VTabFnNext, VTabFnOpen, VTabFnUpdate, VTabKind, VTabModule, VTabModuleImpl, VTabRowIDFn,
+};
 
 pub type Result<T> = std::result::Result<T, ResultCode>;
 pub type ExtensionEntryPoint = unsafe extern "C" fn(api: *const ExtensionApi) -> ResultCode;

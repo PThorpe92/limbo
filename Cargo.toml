@@ -12,7 +12,6 @@ members = [
     "core",
     "extensions/core",
     "extensions/crypto", 
-	"extensions/kvstore",
     "extensions/percentile",
     "extensions/regexp",
     "extensions/series",

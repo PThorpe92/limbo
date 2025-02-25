@@ -469,7 +469,7 @@ def test_series(pipe):
 
 
 def test_kv(pipe):
-    ext_path = "./target/debug/liblimbo_kv"
+    ext_path = "./target/debug/liblimbo_testvfs"
     run_test(
         pipe,
         "create virtual table t using kv_store;",
@@ -543,9 +543,6 @@ def test_kv(pipe):
 
 
 def test_vfs(pipe):
-    ext_path = "./target/debug/liblimbo_testvfs"
-    run_test(pipe, ".vfslist", lambda res: "testvfs" not in res, "testvfs not loaded")
-    write_to_pipe(pipe, f".load {ext_path}")
     write_to_pipe(pipe, ".open testing/vfs_extension.db testvfs")
     run_test(pipe, ".vfslist", lambda res: "testvfs" in res, "testvfs extension loaded")
     write_to_pipe(pipe, test_data)

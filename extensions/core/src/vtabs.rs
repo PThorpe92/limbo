@@ -1,15 +1,21 @@
-use crate::{Result, ResultCode, Value};
+use crate::{ResultCode, Value};
 use std::ffi::{c_char, c_void};
 
-pub type VtabFnCreateSchema = unsafe extern "C" fn(args: *const Value, argc: i32) -> *mut c_char;
-pub type VtabFnOpen = unsafe extern "C" fn(*const c_void) -> *const c_void;
-pub type VtabFnFilter =
+pub type RegisterModuleFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    name: *const c_char,
+    module: VTabModuleImpl,
+    kind: VTabKind,
+) -> ResultCode;
+pub type VTabFnCreateSchema = unsafe extern "C" fn(args: *const Value, argc: i32) -> *mut c_char;
+pub type VTabFnOpen = unsafe extern "C" fn(*const c_void) -> *const c_void;
+pub type VTabFnFilter =
     unsafe extern "C" fn(cursor: *const c_void, argc: i32, argv: *const Value) -> ResultCode;
-pub type VtabFnColumn = unsafe extern "C" fn(cursor: *const c_void, idx: u32) -> Value;
-pub type VtabFnNext = unsafe extern "C" fn(cursor: *const c_void) -> ResultCode;
-pub type VtabFnEof = unsafe extern "C" fn(cursor: *const c_void) -> bool;
-pub type VtabRowIDFn = unsafe extern "C" fn(cursor: *const c_void) -> i64;
-pub type VtabFnUpdate = unsafe extern "C" fn(
+pub type VTabFnColumn = unsafe extern "C" fn(cursor: *const c_void, idx: u32) -> Value;
+pub type VTabFnNext = unsafe extern "C" fn(cursor: *const c_void) -> ResultCode;
+pub type VTabFnEof = unsafe extern "C" fn(cursor: *const c_void) -> bool;
+pub type VTabRowIDFn = unsafe extern "C" fn(cursor: *const c_void) -> i64;
+pub type VTabFnUpdate = unsafe extern "C" fn(
     vtab: *const c_void,
     argc: i32,
     argv: *const Value,
@@ -21,18 +27,18 @@ pub type VtabFnUpdate = unsafe extern "C" fn(
 pub struct VTabModuleImpl {
     pub ctx: *const c_void,
     pub name: *const c_char,
-    pub create_schema: VtabFnCreateSchema,
-    pub open: VtabFnOpen,
-    pub filter: VtabFnFilter,
-    pub column: VtabFnColumn,
-    pub next: VtabFnNext,
-    pub eof: VtabFnEof,
-    pub update: VtabFnUpdate,
-    pub rowid: VtabRowIDFn,
+    pub create_schema: VTabFnCreateSchema,
+    pub open: VTabFnOpen,
+    pub filter: VTabFnFilter,
+    pub column: VTabFnColumn,
+    pub next: VTabFnNext,
+    pub eof: VTabFnEof,
+    pub update: VTabFnUpdate,
+    pub rowid: VTabRowIDFn,
 }
 
 impl VTabModuleImpl {
-    pub fn init_schema(&self, args: Vec<Value>) -> Result<String> {
+    pub fn init_schema(&self, args: Vec<Value>) -> crate::Result<String> {
         let schema = unsafe { (self.create_schema)(args.as_ptr(), args.len() as i32) };
         if schema.is_null() {
             return Err(ResultCode::InvalidArgs);
