@@ -18,16 +18,12 @@ members = [
     "extensions/series",
     "extensions/time",
     "extensions/uuid",
+	"extensions/tests",
     "macros",
     "simulator",
     "sqlite3",
     "stress",
     "tests",
-    "extensions/percentile",
-    "extensions/time",
-    "extensions/crypto",
-    "extensions/series",
-	"extensions/tests",
 ]
 exclude = ["perf/latency/limbo"]
 
