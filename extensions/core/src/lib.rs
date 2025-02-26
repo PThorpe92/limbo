@@ -6,14 +6,14 @@ use std::{
     os::raw::{c_char, c_void},
 };
 pub use types::{ResultCode, Value, ValueType};
-pub use vtab_connect::{ConnectFn, Connection, Stmt};
+pub use vtab_connect::{Conn, ConnectFn, Stmt};
 
 pub type ExtResult<T> = std::result::Result<T, ResultCode>;
 
 #[repr(C)]
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
-    pub conn: *const Connection,
+    pub conn: *const Conn,
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
@@ -21,7 +21,7 @@ pub struct ExtensionApi {
 }
 
 impl ExtensionApi {
-    pub fn connect(&mut self) -> &Connection {
+    pub fn connect(&mut self) -> &Conn {
         let connection = unsafe { (self.connect)(self.ctx) };
         self.conn = connection;
         unsafe { &(*self.conn) }
@@ -101,7 +101,7 @@ impl VTabModuleImpl {
 
 pub type VtabFnCreateSchema = unsafe extern "C" fn(args: *const Value, argc: i32) -> *mut c_char;
 
-pub type VtabFnOpen = unsafe extern "C" fn(*const c_void) -> *const c_void;
+pub type VtabFnOpen = unsafe extern "C" fn(*const c_void, *mut Conn) -> *const c_void;
 
 pub type VtabFnFilter =
     unsafe extern "C" fn(cursor: *const c_void, argc: i32, argv: *const Value) -> ResultCode;
@@ -128,15 +128,14 @@ pub enum VTabKind {
     TableValuedFunction,
 }
 
-pub trait VTabModule: 'static {
-    type VCursor: VTabCursor<Error = Self::Error>;
+pub trait VTabModule<'conn>: 'static {
+    type VCursor: 'conn + VTabCursor<Error = Self::Error>;
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
     type Error: std::fmt::Display;
 
     fn create_schema(args: &[Value]) -> String;
-    fn connect(&self) -> Connection;
-    fn open(&self) -> Result<Self::VCursor, Self::Error>;
+    fn open(&self, conn: &'conn mut Conn) -> Result<Self::VCursor, Self::Error>;
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode;
     fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
     fn next(cursor: &mut Self::VCursor) -> ResultCode;

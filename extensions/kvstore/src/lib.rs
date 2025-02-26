@@ -1,6 +1,6 @@
 use lazy_static::lazy_static;
 use limbo_ext::{
-    register_extension, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
+    register_extension, Conn, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, Value,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -17,13 +17,14 @@ register_extension! {
 pub struct KVStoreVTab;
 
 /// the cursor holds a snapshot of (rowid, key, value) in memory.
-pub struct KVStoreCursor {
+pub struct KVStoreCursor<'a> {
     rows: Vec<(i64, String, String)>,
     index: Option<usize>,
+    conn: &'a mut Conn,
 }
 
-impl VTabModule for KVStoreVTab {
-    type VCursor = KVStoreCursor;
+impl<'conn> VTabModule<'conn> for KVStoreVTab {
+    type VCursor = KVStoreCursor<'conn>;
     const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
     const NAME: &'static str = "kv_store";
     type Error = String;
@@ -32,14 +33,16 @@ impl VTabModule for KVStoreVTab {
         "CREATE TABLE x (key TEXT PRIMARY KEY, value TEXT);".to_string()
     }
 
-    fn open(&self) -> Result<Self::VCursor, Self::Error> {
+    fn open(&self, conn: &'conn mut Conn) -> Result<Self::VCursor, Self::Error> {
         Ok(KVStoreCursor {
             rows: Vec::new(),
             index: None,
+            conn,
         })
     }
 
     fn filter(cursor: &mut Self::VCursor, _args: &[Value]) -> ResultCode {
+        let stmt = cursor.conn.prepare_stmt("SELECT * FROM x;");
         let store = GLOBAL_STORE.lock().unwrap();
         cursor.rows = store
             .iter()
@@ -121,7 +124,7 @@ fn hash_key(key: &str) -> i64 {
     hasher.finish() as i64
 }
 
-impl VTabCursor for KVStoreCursor {
+impl VTabCursor for KVStoreCursor<'_> {
     type Error = String;
 
     fn rowid(&self) -> i64 {

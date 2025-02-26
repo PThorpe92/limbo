@@ -1,5 +1,5 @@
 use crate::{types::OwnedValue, Connection, Statement, StepResult};
-use limbo_ext::{Connection as ExtConn, ResultCode, Stmt, Value};
+use limbo_ext::{Conn as ExtConn, ResultCode, Stmt, Value};
 use std::{
     boxed::Box,
     ffi::{c_char, c_void, CStr, CString},
@@ -19,7 +19,10 @@ pub unsafe extern "C" fn close(ctx: *mut c_void) {
     let _ = conn.close();
 }
 
-pub unsafe extern "C" fn prepare_stmt(ctx: *mut c_void, sql: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn prepare_stmt(
+    ctx: *mut c_void,
+    sql: *const c_char,
+) -> *const Stmt<'static> {
     let c_str = unsafe { CStr::from_ptr(sql as *mut c_char) };
     let sql_str = match c_str.to_str() {
         Ok(s) => s.to_string(),
@@ -28,19 +31,19 @@ pub unsafe extern "C" fn prepare_stmt(ctx: *mut c_void, sql: *const c_char) -> *
     if ctx.is_null() {
         return ptr::null_mut();
     }
-    let conn = unsafe { &*(ctx as *const Rc<Connection>) };
+    let extcon = unsafe { &*(ctx as *const ExtConn) };
+    let conn = unsafe { &*(extcon._ctx as *const Rc<Connection>) };
     let stmt = conn.prepare(&sql_str);
-    let result_stmt = Stmt::new(
-        ctx as *const ExtConn,
+    Box::into_raw(Box::new(Stmt::new(
+        extcon,
         Box::into_raw(Box::new(stmt)) as *mut c_void,
         stmt_bind_args_fn,
         stmt_step,
         stmt_get_row,
         stmt_get_column_names,
-        stmt_close,
         stmt_get_col_count,
-    );
-    Box::into_raw(Box::new(result_stmt)) as *mut c_void
+        stmt_close,
+    ))) as *const Stmt<'static>
 }
 
 pub unsafe extern "C" fn stmt_bind_args_fn(ctx: *mut c_void, idx: i32, arg: Value) -> ResultCode {

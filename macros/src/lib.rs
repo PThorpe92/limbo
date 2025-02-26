@@ -459,13 +459,14 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
             }
 
             #[no_mangle]
-            unsafe extern "C" fn #open_fn_name(ctx: *const ::std::ffi::c_void) -> *const ::std::ffi::c_void {
-                if ctx.is_null() {
+            unsafe extern "C" fn #open_fn_name(ctx: *const ::std::ffi::c_void, conn: *mut ::limbo_ext::Conn) -> *const ::std::ffi::c_void {
+                if ctx.is_null() || conn.is_null() {
                     return ::std::ptr::null();
                 }
                 let ctx  = ctx as *const #struct_name;
                 let ctx: &#struct_name = &*ctx;
-                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx) {
+                let conn = {&mut *conn} as &mut ::limbo_ext::Conn;
+                if let Ok(cursor) = <#struct_name as ::limbo_ext::VTabModule>::open(ctx, conn) {
                     return ::std::boxed::Box::into_raw(::std::boxed::Box::new(cursor)) as *const ::std::ffi::c_void;
                 } else {
                     return ::std::ptr::null();
