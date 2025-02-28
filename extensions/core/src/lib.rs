@@ -4,28 +4,21 @@ pub use limbo_macros::{register_extension, scalar, AggregateDerive, VTabModuleDe
 use std::{
     fmt::Display,
     os::raw::{c_char, c_void},
+    rc::Rc,
 };
 pub use types::{ResultCode, Value, ValueType};
-pub use vtab_connect::{Conn, ConnectFn, Stmt};
+pub use vtab_connect::{Conn, ConnectFn, Connection, Stmt};
 
 pub type ExtResult<T> = std::result::Result<T, ResultCode>;
 
 #[repr(C)]
 pub struct ExtensionApi {
     pub ctx: *mut c_void,
-    pub conn: *const Conn,
+    pub conn: *mut Conn,
     pub register_scalar_function: RegisterScalarFn,
     pub register_aggregate_function: RegisterAggFn,
     pub register_module: RegisterModuleFn,
     pub connect: ConnectFn,
-}
-
-impl ExtensionApi {
-    pub fn connect(&mut self) -> &Conn {
-        let connection = unsafe { (self.connect)(self.ctx) };
-        self.conn = connection;
-        unsafe { &(*self.conn) }
-    }
 }
 
 pub type ExtensionEntryPoint = unsafe extern "C" fn(api: *const ExtensionApi) -> ResultCode;
@@ -74,6 +67,7 @@ pub trait AggFunc {
 #[derive(Clone, Debug)]
 pub struct VTabModuleImpl {
     pub ctx: *const c_void,
+    pub conn: *mut Conn,
     pub name: *const c_char,
     pub create_schema: VtabFnCreateSchema,
     pub open: VtabFnOpen,
@@ -128,14 +122,14 @@ pub enum VTabKind {
     TableValuedFunction,
 }
 
-pub trait VTabModule<'conn>: 'static {
-    type VCursor: 'conn + VTabCursor<Error = Self::Error>;
+pub trait VTabModule: 'static {
+    type VCursor: VTabCursor<Error = Self::Error>;
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
     type Error: std::fmt::Display;
 
     fn create_schema(args: &[Value]) -> String;
-    fn open(&self, conn: &'conn mut Conn) -> Result<Self::VCursor, Self::Error>;
+    fn open(&self, conn: Rc<Connection>) -> Result<Self::VCursor, Self::Error>;
     fn filter(cursor: &mut Self::VCursor, args: &[Value]) -> ResultCode;
     fn column(cursor: &Self::VCursor, idx: u32) -> Result<Value, Self::Error>;
     fn next(cursor: &mut Self::VCursor) -> ResultCode;

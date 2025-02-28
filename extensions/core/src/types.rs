@@ -85,6 +85,12 @@ pub struct Value {
     value: ValueData,
 }
 
+impl Default for Value {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
 #[repr(C)]
 union ValueData {
     int: i64,
