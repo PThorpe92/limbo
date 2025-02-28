@@ -104,12 +104,7 @@ impl MemoryFile {
             // Make sure that we are accessing into a valid memory page
             assert!(end <= pages.len());
 
-            let page = &pages[start..end];
-            if page.is_empty() {
-                None
-            } else {
-                Some(page)
-            }
+            pages.get(start..end)
         }
         #[cfg(not(target_family = "unix"))]
         unsafe {
