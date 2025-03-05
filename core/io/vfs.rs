@@ -1,6 +1,6 @@
 use crate::ext::VfsMod;
 use crate::{LimboError, Result};
-use limbo_ext::VfsFileImpl;
+use limbo_ext::{VfsFileImpl, VfsImpl};
 use std::ffi::{c_void, CString};
 use std::{cell::RefCell, rc::Rc};
 
@@ -136,6 +136,17 @@ impl File for VfsFileImpl {
             Err(LimboError::ExtensionError("size failed".to_string()))
         } else {
             Ok(result as u64)
+        }
+    }
+}
+
+impl Drop for VfsMod {
+    fn drop(&mut self) {
+        if self.ctx.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = Box::from_raw(self.ctx as *mut VfsImpl);
         }
     }
 }
