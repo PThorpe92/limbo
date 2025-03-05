@@ -19,6 +19,11 @@ pub struct VTabImpl {
     pub implementation: Rc<VTabModuleImpl>,
 }
 
+#[derive(Clone, Debug)]
+pub struct VfsMod {
+    pub ctx: *const VfsImpl,
+}
+
 unsafe extern "C" fn register_scalar_function(
     ctx: *mut c_void,
     name: *const c_char,
@@ -92,7 +97,7 @@ unsafe extern "C" fn register_vfs(
         Err(_) => return ResultCode::Error,
     };
     let db = unsafe { &mut *(ctx as *mut Database) };
-    db.register_vfs_impl(name_str, vfs)
+    db.register_vfs_impl(name_str, Arc::new(VfsMod { ctx: vfs }))
 }
 
 /// Get pointers to all the vfs extensions that need to be built in at compile time.
@@ -100,7 +105,7 @@ unsafe extern "C" fn register_vfs(
 /// until the database file is opened and `register_builtins` is called.
 pub fn add_builtin_vfs_extensions(
     api: Option<ExtensionApi>,
-) -> crate::Result<Vec<(String, *const VfsImpl)>> {
+) -> crate::Result<Vec<(String, Arc<VfsMod>)>> {
     let mut vfslist: Vec<*const VfsImpl> = Vec::new();
     let mut api = match api {
         None => ExtensionApi {
@@ -134,7 +139,12 @@ pub fn add_builtin_vfs_extensions(
                 })?
                 .to_string()
         };
-        vfslist.push((name, *vfs));
+        vfslist.push((
+            name,
+            Arc::new(VfsMod {
+                ctx: vfsimpl as *const _,
+            }),
+        ));
     }
     Ok(vfslist)
 }
@@ -164,7 +174,7 @@ impl Database {
                 let syms = self.syms.borrow();
                 let vfs = syms.vfs_modules.iter().find(|v| v.0 == vfs);
                 match vfs {
-                    Some((_, vfs)) => Arc::new(*vfs),
+                    Some((_, vfs)) => vfs.clone(),
                     None => {
                         return Err(LimboError::InvalidArgument(format!(
                             "no such VFS: {}",
@@ -240,8 +250,8 @@ impl Database {
         }
     }
 
-    pub fn register_vfs_impl(&self, name: String, vfs: *const VfsImpl) -> ResultCode {
-        if vfs.is_null() {
+    pub fn register_vfs_impl(&self, name: String, vfs: Arc<VfsMod>) -> ResultCode {
+        if vfs.ctx.is_null() {
             return ResultCode::Error;
         }
         if self

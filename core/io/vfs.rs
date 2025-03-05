@@ -1,46 +1,51 @@
+use crate::ext::VfsMod;
 use crate::{LimboError, Result};
-use limbo_ext::{VfsFileImpl, VfsImpl};
+use limbo_ext::VfsFileImpl;
 use std::ffi::{c_void, CString};
 use std::{cell::RefCell, rc::Rc};
 
 use super::{Buffer, Completion, File, OpenFlags, IO};
 
-impl IO for *const VfsImpl {
+impl IO for VfsMod {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Rc<dyn File>> {
         let c_path = CString::new(path).map_err(|_| {
             LimboError::ExtensionError("Failed to convert path to CString".to_string())
         })?;
-        let ctx = (*self) as *mut c_void;
-        let vfs = unsafe { &**self };
+        let ctx = self.ctx as *mut c_void;
+        let vfs = unsafe { &*self.ctx };
         let file = unsafe { (vfs.open)(ctx, c_path.as_ptr(), flags.bits(), direct) };
         if file.is_null() {
             return Err(LimboError::ExtensionError("File not found".to_string()));
         }
-        Ok(Rc::new(limbo_ext::VfsFileImpl::new(file, *self)?))
+        Ok(Rc::new(limbo_ext::VfsFileImpl::new(file, self.ctx)?))
     }
 
     fn run_once(&self) -> Result<()> {
-        unsafe {
-            if self.is_null() {
-                return Err(LimboError::ExtensionError("VFS is null".to_string()));
-            }
-            let vfs = &**self;
-            let result = (vfs.run_once)(vfs.vfs);
-            if !result.is_ok() {
-                return Err(LimboError::ExtensionError(result.to_string()));
-            }
-            Ok(())
+        if self.ctx.is_null() {
+            return Err(LimboError::ExtensionError("VFS is null".to_string()));
         }
+        let vfs = unsafe { &*self.ctx };
+        let result = unsafe { (vfs.run_once)(vfs.vfs) };
+        if !result.is_ok() {
+            return Err(LimboError::ExtensionError(result.to_string()));
+        }
+        Ok(())
     }
 
     fn generate_random_number(&self) -> i64 {
-        let vfs = unsafe { &**self };
+        if self.ctx.is_null() {
+            return -1;
+        }
+        let vfs = unsafe { &*self.ctx };
         unsafe { (vfs.gen_random_number)() }
     }
 
     fn get_current_time(&self) -> String {
+        if self.ctx.is_null() {
+            return "".to_string();
+        }
         unsafe {
-            let vfs = &**self;
+            let vfs = &*self.ctx;
             let chars = (vfs.current_time)();
             let cstr = CString::from_raw(chars as *mut i8);
             cstr.to_string_lossy().into_owned()

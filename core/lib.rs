@@ -24,12 +24,13 @@ mod vector;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(feature = "fs")]
 use ext::add_builtin_vfs_extensions;
+use ext::VfsMod;
 use fallible_iterator::FallibleIterator;
 #[cfg(not(target_family = "wasm"))]
 use libloading::{Library, Symbol};
 #[cfg(not(target_family = "wasm"))]
 use limbo_ext::{ExtensionApi, ExtensionEntryPoint};
-use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl, VfsImpl};
+use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl};
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
 use parking_lot::RwLock;
 use schema::{Column, Schema};
@@ -215,8 +216,8 @@ impl Database {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_new(path: &str, vfs: &str) -> Result<(Arc<dyn IO>, Arc<Database>)> {
         let vfsmods = add_builtin_vfs_extensions(None)?;
-        let io: Arc<dyn IO> = match vfsmods.iter().find(|v| v.0 == vfs).map(|v| v.1) {
-            Some(ref vfs) => Arc::new(*vfs),
+        let io: Arc<dyn IO> = match vfsmods.iter().find(|v| v.0 == vfs).map(|v| v.1.clone()) {
+            Some(vfs) => vfs,
             None => match vfs.trim() {
                 "memory" => Arc::new(MemoryIO::new()?),
                 "syscall" => Arc::new(PlatformIO::new()?),
@@ -702,7 +703,7 @@ pub(crate) struct SymbolTable {
     extensions: Vec<(Library, *const ExtensionApi)>,
     pub vtab_modules: HashMap<String, Rc<crate::ext::VTabImpl>>,
     pub vtabs: HashMap<String, Rc<VirtualTable>>,
-    pub vfs_modules: Vec<(String, *const VfsImpl)>,
+    pub vfs_modules: Vec<(String, Arc<VfsMod>)>,
 }
 
 impl std::fmt::Debug for SymbolTable {
