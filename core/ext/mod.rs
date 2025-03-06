@@ -1,6 +1,8 @@
 #[cfg(all(feature = "io_uring", target_os = "linux"))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, io::IO, Database, LimboError, MemoryIO, PlatformIO};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod dynamic;
 use limbo_ext::{
     ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind, VTabModuleImpl, VfsImpl,
 };
@@ -8,9 +10,11 @@ pub use limbo_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
+type Vfs = (String, Arc<VfsMod>);
 
+static VFS_MODULES: OnceLock<Mutex<Vec<Vfs>>> = OnceLock::new();
 type ExternAggFunc = (InitAggFunction, StepFunction, FinalizeFunction);
 
 #[derive(Clone)]
@@ -23,6 +27,8 @@ pub struct VTabImpl {
 pub struct VfsMod {
     pub ctx: *const VfsImpl,
 }
+unsafe impl Send for VfsMod {}
+unsafe impl Sync for VfsMod {}
 
 unsafe extern "C" fn register_scalar_function(
     ctx: *mut c_void,
@@ -83,12 +89,9 @@ unsafe extern "C" fn register_module(
     db.register_module_impl(&name_str, module, kind)
 }
 
-unsafe extern "C" fn register_vfs(
-    ctx: *mut c_void,
-    name: *const c_char,
-    vfs: *const VfsImpl,
-) -> ResultCode {
-    if ctx.is_null() || name.is_null() || vfs.is_null() {
+#[allow(clippy::arc_with_non_send_sync)]
+unsafe extern "C" fn register_vfs(name: *const c_char, vfs: *const VfsImpl) -> ResultCode {
+    if name.is_null() || vfs.is_null() {
         return ResultCode::Error;
     }
     let c_str = unsafe { CString::from_raw(name as *mut i8) };
@@ -96,13 +99,14 @@ unsafe extern "C" fn register_vfs(
         Ok(s) => s.to_string(),
         Err(_) => return ResultCode::Error,
     };
-    let db = unsafe { &mut *(ctx as *mut Database) };
-    db.register_vfs_impl(name_str, Arc::new(VfsMod { ctx: vfs }))
+    add_vfs_module(name_str, Arc::new(VfsMod { ctx: vfs }));
+    ResultCode::OK
 }
 
 /// Get pointers to all the vfs extensions that need to be built in at compile time.
 /// any other types that are defined in the same extension will not be registered
 /// until the database file is opened and `register_builtins` is called.
+#[allow(clippy::arc_with_non_send_sync)]
 pub fn add_builtin_vfs_extensions(
     api: Option<ExtensionApi>,
 ) -> crate::Result<Vec<(String, Arc<VfsMod>)>> {
@@ -119,6 +123,7 @@ pub fn add_builtin_vfs_extensions(
         },
         Some(mut api) => {
             api.builtin_vfs = vfslist.as_mut_ptr();
+            api.register_vfs = register_vfs;
             api
         }
     };
@@ -170,33 +175,18 @@ impl Database {
             "syscall" => Arc::new(PlatformIO::new()?),
             #[cfg(all(target_os = "linux", feature = "io_uring"))]
             "io_uring" => Arc::new(UringIO::new()?),
-            other => {
-                let syms = self.syms.borrow();
-                let vfs = syms.vfs_modules.iter().find(|v| v.0 == vfs);
-                match vfs {
-                    Some((_, vfs)) => vfs.clone(),
-                    None => {
-                        return Err(LimboError::InvalidArgument(format!(
-                            "no such VFS: {}",
-                            other
-                        )));
-                    }
+            other => match get_vfs_modules().iter().find(|v| v.0 == vfs) {
+                Some((_, vfs)) => vfs.clone(),
+                None => {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "no such VFS: {}",
+                        other
+                    )));
                 }
-            }
+            },
         };
         let db = Self::open_file(io.clone(), path)?;
-        Ok((
-            io,
-            Database {
-                syms: self.syms.clone(),
-                pager: db.pager.clone(),
-                schema: db.schema.clone(),
-                header: db.header.clone(),
-                _shared_wal: db._shared_wal.clone(),
-                _shared_page_cache: db._shared_page_cache.clone(),
-            }
-            .into(),
-        ))
+        Ok((io, db))
     }
 
     fn register_scalar_function_impl(&self, name: &str, func: ScalarFunction) -> ResultCode {
@@ -250,23 +240,6 @@ impl Database {
         }
     }
 
-    pub fn register_vfs_impl(&self, name: String, vfs: Arc<VfsMod>) -> ResultCode {
-        if vfs.ctx.is_null() {
-            return ResultCode::Error;
-        }
-        if self
-            .syms
-            .borrow()
-            .vfs_modules
-            .iter()
-            .any(|(n, _)| n.eq(&name))
-        {
-            return ResultCode::Error;
-        }
-        self.syms.borrow_mut().vfs_modules.push((name, vfs));
-        ResultCode::OK
-    }
-
     pub fn register_builtins(&self) -> Result<(), String> {
         #[allow(unused_variables, unused_mut)]
         let mut ext_api = self.build_limbo_ext();
@@ -300,8 +273,36 @@ impl Database {
         }
         let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
         for (name, vfs) in vfslist {
-            self.register_vfs_impl(name, vfs);
+            add_vfs_module(name, vfs);
         }
         Ok(())
     }
+}
+
+fn add_vfs_module(name: String, vfs: Arc<VfsMod>) {
+    let mut modules = VFS_MODULES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if !modules.iter().any(|v| v.0 == name) {
+        modules.push((name, vfs));
+    }
+}
+
+pub fn list_vfs_modules() -> Vec<String> {
+    VFS_MODULES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|v| v.0.clone())
+        .collect()
+}
+
+fn get_vfs_modules() -> Vec<Vfs> {
+    VFS_MODULES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .clone()
 }

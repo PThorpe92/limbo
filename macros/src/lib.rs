@@ -686,7 +686,7 @@ pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
                 current_time: #get_current_time_fn_name,
             };
             let vfsimpl = ::std::boxed::Box::into_raw(::std::boxed::Box::new(vfs_mod)) as *const ::limbo_ext::VfsImpl;
-            (api.register_vfs)(api.ctx, name, vfsimpl)
+            (api.register_vfs)(name, vfsimpl)
         }
 
         #[no_mangle]

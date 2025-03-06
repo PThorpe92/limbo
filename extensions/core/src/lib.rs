@@ -16,6 +16,13 @@ pub struct ExtensionApi {
     pub builtin_vfs: *mut *const VfsImpl,
     pub builtin_vfs_count: i32,
 }
+unsafe impl Send for ExtensionApi {}
+unsafe impl Send for ExtensionApiRef {}
+
+#[repr(C)]
+pub struct ExtensionApiRef {
+    pub api: *const ExtensionApi,
+}
 
 impl ExtensionApi {
     /// Since we want the option to build in extensions at compile time as well,
@@ -90,7 +97,7 @@ pub struct VfsImpl {
 }
 
 pub type RegisterVfsFn =
-    unsafe extern "C" fn(ctx: *mut c_void, name: *const c_char, vfs: *const VfsImpl) -> ResultCode;
+    unsafe extern "C" fn(name: *const c_char, vfs: *const VfsImpl) -> ResultCode;
 
 pub type VfsOpen = unsafe extern "C" fn(
     ctx: *const c_void,
@@ -138,7 +145,7 @@ impl VfsFileImpl {
 
 impl Drop for VfsFileImpl {
     fn drop(&mut self) {
-        if self.vfs.is_null() {
+        if self.vfs.is_null() || self.file.is_null() {
             return;
         }
         let vfs = unsafe { &*self.vfs };
