@@ -136,22 +136,6 @@ impl ProgramBuilder {
         }
     }
 
-    pub fn emit_open_read(&mut self, root_page: usize, cursor_id: usize) {
-        self.emit_insn(Insn::OpenReadAsync {
-            cursor_id,
-            root_page,
-        });
-        self.emit_insn(Insn::OpenReadAwait {});
-    }
-
-    pub fn emit_open_write(&mut self, root_page: usize, cursor_id: usize) {
-        self.emit_insn(Insn::OpenWriteAsync {
-            cursor_id,
-            root_page,
-        });
-        self.emit_insn(Insn::OpenWriteAwait {});
-    }
-
     pub fn emit_string8(&mut self, value: String, dest: usize) {
         self.emit_insn(Insn::String8 { value, dest });
     }

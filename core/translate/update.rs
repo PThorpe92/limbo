@@ -93,6 +93,7 @@ pub fn translate_update(
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id,
         root_page,
+        is_new_idx: false,
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 

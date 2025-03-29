@@ -8,6 +8,7 @@ use crate::storage::sqlite3_ondisk::write_varint;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::{Register, VTabOpaqueCursor};
 use crate::Result;
+use std::cmp::Ordering;
 use std::fmt::Display;
 
 const MAX_REAL_SIZE: u8 = 15;
@@ -1010,6 +1011,156 @@ impl PartialOrd<RefValue> for RefValue {
 
 pub fn compare_immutable(l: &[RefValue], r: &[RefValue]) -> std::cmp::Ordering {
     l.partial_cmp(r).unwrap()
+}
+
+#[allow(clippy::non_canonical_partial_ord_impl)]
+impl PartialOrd<OwnedValue> for RefValue {
+    fn partial_cmp(&self, other: &OwnedValue) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Integer(int_left), OwnedValue::Integer(int_right)) => {
+                int_left.partial_cmp(int_right)
+            }
+            (Self::Integer(int_left), OwnedValue::Float(float_right)) => {
+                (*int_left as f64).partial_cmp(float_right)
+            }
+            (Self::Float(float_left), OwnedValue::Integer(int_right)) => {
+                float_left.partial_cmp(&(*int_right as f64))
+            }
+            (Self::Float(float_left), OwnedValue::Float(float_right)) => {
+                float_left.partial_cmp(float_right)
+            }
+            // Numeric vs Text/Blob
+            (Self::Integer(_) | Self::Float(_), OwnedValue::Text(_) | OwnedValue::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
+            }
+            (Self::Text(_) | Self::Blob(_), OwnedValue::Integer(_) | OwnedValue::Float(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
+
+            (Self::Text(text_left), OwnedValue::Text(text_right)) => {
+                let text_left = text_left.value.to_slice();
+                text_left.partial_cmp(&text_right.value)
+            }
+            // Text vs Blob
+            (Self::Text(_), OwnedValue::Blob(_)) => Some(std::cmp::Ordering::Less),
+            (Self::Blob(_), OwnedValue::Text(_)) => Some(std::cmp::Ordering::Greater),
+
+            (Self::Blob(blob_left), OwnedValue::Blob(blob_right)) => {
+                let blob_left = blob_left.to_slice();
+                blob_left.partial_cmp(blob_right)
+            }
+            (Self::Null, OwnedValue::Null) => Some(std::cmp::Ordering::Equal),
+            (Self::Null, _) => Some(std::cmp::Ordering::Less),
+            (_, OwnedValue::Null) => Some(std::cmp::Ordering::Greater),
+        }
+    }
+}
+
+#[allow(clippy::non_canonical_partial_ord_impl)]
+impl PartialOrd<RefValue> for OwnedValue {
+    fn partial_cmp(&self, other: &RefValue) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Integer(int_left), RefValue::Integer(int_right)) => {
+                int_left.partial_cmp(int_right)
+            }
+            (Self::Integer(int_left), RefValue::Float(float_right)) => {
+                (*int_left as f64).partial_cmp(float_right)
+            }
+            (Self::Float(float_left), RefValue::Integer(int_right)) => {
+                float_left.partial_cmp(&(*int_right as f64))
+            }
+            (Self::Float(float_left), RefValue::Float(float_right)) => {
+                float_left.partial_cmp(float_right)
+            }
+            // Numeric vs Text/Blob
+            (Self::Integer(_) | Self::Float(_), RefValue::Text(_) | RefValue::Blob(_)) => {
+                Some(std::cmp::Ordering::Less)
+            }
+            (Self::Text(_) | Self::Blob(_), RefValue::Integer(_) | RefValue::Float(_)) => {
+                Some(std::cmp::Ordering::Greater)
+            }
+
+            (Self::Text(text_left), RefValue::Text(text_right)) => {
+                let text_right = text_right.value.to_slice();
+                text_left.value.as_slice().partial_cmp(text_right)
+            }
+            // Text vs Blob
+            (Self::Text(_), RefValue::Blob(_)) => Some(std::cmp::Ordering::Less),
+            (Self::Blob(_), RefValue::Text(_)) => Some(std::cmp::Ordering::Greater),
+
+            (Self::Blob(blob_left), RefValue::Blob(blob_right)) => {
+                let blob_right = blob_right.to_slice();
+                blob_left.as_slice().partial_cmp(blob_right)
+            }
+            (Self::Null, RefValue::Null) => Some(std::cmp::Ordering::Equal),
+            (Self::Null, _) => Some(std::cmp::Ordering::Less),
+            (_, RefValue::Null) => Some(std::cmp::Ordering::Greater),
+        }
+    }
+}
+
+impl PartialEq<RefValue> for OwnedValue {
+    fn eq(&self, other: &RefValue) -> bool {
+        match (self, other) {
+            (Self::Integer(int_left), RefValue::Integer(int_right)) => int_left == int_right,
+            (Self::Float(float_left), RefValue::Float(float_right)) => float_left == float_right,
+            (Self::Text(text_left), RefValue::Text(text_right)) => {
+                text_left.value.as_slice() == text_right.value.to_slice()
+            }
+            (Self::Blob(blob_left), RefValue::Blob(blob_right)) => {
+                blob_left.as_slice() == blob_right.to_slice()
+            }
+            (Self::Null, RefValue::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<OwnedValue> for RefValue {
+    fn eq(&self, other: &OwnedValue) -> bool {
+        match (self, other) {
+            (Self::Integer(int_left), OwnedValue::Integer(int_right)) => int_left == int_right,
+            (Self::Float(float_left), OwnedValue::Float(float_right)) => float_left == float_right,
+            (Self::Text(text_left), OwnedValue::Text(text_right)) => {
+                text_left.value.to_slice() == text_right.value.as_slice()
+            }
+            (Self::Blob(blob_left), OwnedValue::Blob(blob_right)) => {
+                blob_left.to_slice() == blob_right.as_slice()
+            }
+            (Self::Null, OwnedValue::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+pub fn compare_record_to_immutable(
+    record: &[OwnedValue],
+    immutable: &[RefValue],
+) -> std::cmp::Ordering {
+    for (a, b) in record.iter().zip(immutable.iter()) {
+        match a.partial_cmp(b).unwrap() {
+            Ordering::Equal => {}
+            order => {
+                return order;
+            }
+        }
+    }
+    Ordering::Equal
+}
+
+pub fn compare_immutable_to_record(
+    immutable: &[RefValue],
+    record: &[OwnedValue],
+) -> std::cmp::Ordering {
+    for (a, b) in immutable.iter().zip(record.iter()) {
+        match a.partial_cmp(b).unwrap() {
+            Ordering::Equal => {}
+            order => {
+                return order;
+            }
+        }
+    }
+    Ordering::Equal
 }
 
 const I8_LOW: i64 = -128;

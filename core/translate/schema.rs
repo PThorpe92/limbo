@@ -104,6 +104,7 @@ pub fn translate_create_table(
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1,
+        is_new_idx: false,
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -500,6 +501,7 @@ pub fn translate_create_virtual_table(
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1,
+        is_new_idx: false,
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -573,7 +575,7 @@ pub fn translate_drop_table(
     let row_id_reg = program.alloc_register(); //  r5
 
     let table_name = "sqlite_schema";
-    let schema_table = schema.get_btree_table(&table_name).unwrap();
+    let schema_table = schema.get_btree_table(table_name).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
         Some(table_name.to_string()),
         CursorType::BTreeTable(schema_table.clone()),
@@ -581,6 +583,7 @@ pub fn translate_drop_table(
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1,
+        is_new_idx: false,
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 

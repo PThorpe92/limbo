@@ -22,53 +22,35 @@ pub fn translate_create_index(
     columns: &[SortedColumn],
     schema: &Schema,
 ) -> crate::Result<ProgramBuilder> {
+    let idx_name = normalize_ident(idx_name);
+    let tbl_name = normalize_ident(tbl_name);
     let mut program = ProgramBuilder::new(crate::vdbe::builder::ProgramBuilderOpts {
         query_mode: mode,
-        num_cursors: 4,
-        approx_num_insns: 50,
+        num_cursors: 5,
+        approx_num_insns: 40,
         approx_num_labels: 5,
     });
-    if !schema.is_unique_idx_name(idx_name) {
+
+    // Check if the index is being created on a valid btree table and
+    // the name is globally unique in the schema.
+    if !schema.is_unique_idx_name(&idx_name) {
         crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
     }
-    let Some(tbl) = schema.tables.get(tbl_name) else {
+    let Some(tbl) = schema.tables.get(&tbl_name) else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
     let Some(tbl) = tbl.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };
-    let idx_name = normalize_ident(idx_name);
     let columns = resolve_sorted_columns(&tbl, columns)?;
+
+    // Prologue:
     let init_label = program.emit_init();
     let start_offset = program.offset();
-    // create a new B-Tree and store the root page index in a register
-    let root_page_reg = program.alloc_register();
-    program.emit_insn(Insn::CreateBtree {
-        db: 0,
-        root: root_page_reg,
-        flags: 2, // index leaf
-    });
 
-    // open the schema table to store the new index entry
-    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(
-        Some(SQLITE_TABLEID.to_owned()),
-        CursorType::BTreeTable(sqlite_table.clone()),
-    );
-    program.emit_open_write(sqlite_table.root_page, sqlite_schema_cursor_id);
-    let sql = create_idx_stmt_to_sql(tbl_name, &idx_name, unique_if_not_exists, &columns);
-    emit_schema_entry(
-        &mut program,
-        sqlite_schema_cursor_id,
-        SchemaEntryType::Index,
-        &idx_name,
-        tbl_name,
-        root_page_reg,
-        Some(sql),
-    );
     let idx = Arc::new(Index {
         name: idx_name.clone(),
-        table_name: tbl.name.to_string(),
+        table_name: tbl.name.clone(),
         root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns: columns
             .iter()
@@ -79,20 +61,58 @@ pub fn translate_create_index(
             .collect(),
         unique: unique_if_not_exists.0,
     });
-    // open the btree we just created for writing, NOTE: we are using an Index
-    // cursor type here, but the root page isn't set until we parse the schema table
+
+    // Allocate the necessary cursors.
+    //
+    // 1. sqlite_schema_cursor_id - for the sqlite_schema table
+    // 2. btree_cursor_id - for the index btree
+    // 3. table_cursor_id - for the table we are creating the index on
+    // 4. sorter_cursor_id - for the sorter
+    // 5. pseudo_cursor_id - for the pseudo table to store the sorted index values
+    let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(
+        Some(SQLITE_TABLEID.to_owned()),
+        CursorType::BTreeTable(sqlite_table.clone()),
+    );
     let btree_cursor_id = program.alloc_cursor_id(
         Some(idx_name.to_owned()),
         CursorType::BTreeIndex(idx.clone()),
     );
-    program.emit_open_write(root_page_reg, btree_cursor_id);
-
+    let table_cursor_id = program.alloc_cursor_id(
+        Some(tbl_name.to_owned()),
+        CursorType::BTreeTable(tbl.clone()),
+    );
+    let sorter_cursor_id = program.alloc_cursor_id(None, CursorType::Sorter);
     let pseudo_table = PseudoTable::new_with_columns(tbl.columns.clone());
     let pseudo_cursor_id = program.alloc_cursor_id(None, CursorType::Pseudo(pseudo_table.into()));
 
-    let sorted_loop_start = program.allocate_label();
-    let sorted_loop_end = program.allocate_label();
-    let sorter_cursor_id = program.alloc_cursor_id(None, CursorType::Sorter);
+    // Create a new B-Tree and store the root page index in a register
+    let root_page_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: 0,
+        root: root_page_reg,
+        flags: 2, // index leaf
+    });
+
+    // open the sqlite schema table for writing and create a new entry for the index
+    program.emit_insn(Insn::OpenWriteAsync {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: sqlite_table.root_page,
+        is_new_idx: false,
+    });
+    program.emit_insn(Insn::OpenWriteAwait {});
+    let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
+    emit_schema_entry(
+        &mut program,
+        sqlite_schema_cursor_id,
+        SchemaEntryType::Index,
+        &idx_name,
+        &tbl_name,
+        root_page_reg,
+        Some(sql),
+    );
+
+    // determine the order of the columns in the index for the sorter
     let order = idx
         .columns
         .iter()
@@ -103,34 +123,43 @@ pub fn translate_create_index(
             })
         })
         .collect();
+    // open the sorter and the pseudo table
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sorter_cursor_id,
         columns: columns.len(),
         order: Record::new(order),
     });
+    let content_reg = program.alloc_register();
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: pseudo_cursor_id,
+        content_reg,
+        num_fields: columns.len() + 1,
+    });
 
-    // loop over table
-    let loop_start_label = program.allocate_label();
-    let loop_end_label = program.allocate_label();
-    program.resolve_label(loop_start_label, program.offset());
+    // open the table we are creating the index on for reading
+    program.emit_insn(Insn::OpenReadAsync {
+        cursor_id: table_cursor_id,
+        root_page: tbl.root_page,
+    });
+    program.emit_insn(Insn::OpenReadAwait {});
 
-    // open the table we need to create the index on for reading, so first allocate cursor id
-    let table_cursor_id = program.alloc_cursor_id(
-        Some(tbl_name.to_owned()),
-        CursorType::BTreeTable(tbl.clone()),
-    );
-    program.emit_open_read(tbl.root_page, table_cursor_id);
     program.emit_insn(Insn::RewindAsync {
         cursor_id: table_cursor_id,
     });
+    let loop_start_label = program.allocate_label();
+    let loop_end_label = program.allocate_label();
     program.emit_insn(Insn::RewindAwait {
         cursor_id: table_cursor_id,
         pc_if_empty: loop_end_label,
     });
 
-    // collect index values into start_reg..rowid_reg
-    // emit MakeRecord (index key + rowid) into record_reg
-    let record_reg = program.alloc_register();
+    program.resolve_label(loop_start_label, program.offset());
+
+    // Loop start:
+    // Collect index values into start_reg..rowid_reg
+    // emit MakeRecord (index key + rowid) into record_reg.
+    //
+    // Then insert the record into the sorter
     let start_reg = program.alloc_registers(columns.len() + 1);
     for (i, (col, _)) in columns.iter().enumerate() {
         program.emit_insn(Insn::Column {
@@ -144,6 +173,7 @@ pub fn translate_create_index(
         cursor_id: table_cursor_id,
         dest: rowid_reg,
     });
+    let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg,
         count: columns.len() + 1,
@@ -163,6 +193,19 @@ pub fn translate_create_index(
     });
     program.resolve_label(loop_end_label, program.offset());
 
+    // Open the index btree we created for writing to insert the
+    // newly sorted index records.
+    program.emit_insn(Insn::OpenWriteAsync {
+        cursor_id: btree_cursor_id,
+        root_page: root_page_reg,
+        is_new_idx: true,
+    });
+    program.emit_insn(Insn::OpenWriteAwait {});
+
+    let sorted_loop_start = program.allocate_label();
+    let sorted_loop_end = program.allocate_label();
+
+    // Sort the index records in the sorter
     program.emit_insn(Insn::SorterSort {
         cursor_id: sorter_cursor_id,
         pc_if_empty: sorted_loop_end,
@@ -175,6 +218,10 @@ pub fn translate_create_index(
         dest_reg: sorted_record_reg,
     });
 
+    // seek to the end of the index btree to position the cursor for appending
+    program.emit_insn(Insn::SeekEnd {
+        cursor_id: btree_cursor_id,
+    });
     // insert new index record
     program.emit_insn(Insn::IdxInsertAsync {
         cursor_id: btree_cursor_id,
@@ -192,21 +239,25 @@ pub fn translate_create_index(
     });
     program.resolve_label(sorted_loop_end, program.offset());
 
-    // close cursors, keep schema table open to emit parse schema
+    // End of the outer loop
+    //
+    // Keep schema table open to emit ParseSchema, close the other cursors.
     program.close_cursors(&[sorter_cursor_id, table_cursor_id, btree_cursor_id]);
 
     // TODO: SetCookie for schema change
     //
-    // parse the schema table to get the index root page and add new index to Schema
+    // Parse the schema table to get the index root page and add new index to Schema
     let parse_schema_where_clause = format!("name = '{}' AND type = 'index'", idx_name);
     program.emit_insn(Insn::ParseSchema {
         db: sqlite_schema_cursor_id,
         where_clause: parse_schema_where_clause,
     });
+    // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
         cursor_id: sqlite_schema_cursor_id,
     });
 
+    // Epilogue:
     program.emit_halt();
     program.resolve_label(init_label, program.offset());
     program.emit_transaction(true);

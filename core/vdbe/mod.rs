@@ -41,7 +41,7 @@ use crate::storage::{btree::BTreeCursor, pager::Pager};
 use crate::translate::plan::{ResultSetColumn, TableReference};
 use crate::types::{
     compare_immutable, AggContext, Cursor, CursorResult, ExternalAggState, ImmutableRecord,
-    OwnedValue, Record, SeekKey, SeekOp,
+    OwnedValue, SeekKey, SeekOp,
 };
 use crate::util::{
     cast_real_to_integer, cast_text_to_integer, cast_text_to_numeric, cast_text_to_real,
@@ -835,7 +835,7 @@ impl Program {
                 } => {
                     assert!(target_pc.is_offset());
                     if exec_if(
-                        &state.registers[*reg].get_owned_value(),
+                        state.registers[*reg].get_owned_value(),
                         *jump_if_null,
                         false,
                     ) {
@@ -850,11 +850,7 @@ impl Program {
                     jump_if_null,
                 } => {
                     assert!(target_pc.is_offset());
-                    if exec_if(
-                        &state.registers[*reg].get_owned_value(),
-                        *jump_if_null,
-                        true,
-                    ) {
+                    if exec_if(state.registers[*reg].get_owned_value(), *jump_if_null, true) {
                         state.pc = target_pc.to_offset_int();
                     } else {
                         state.pc += 1;
@@ -1157,6 +1153,7 @@ impl Program {
                     dest,
                 } => {
                     if let Some((index_cursor_id, table_cursor_id)) = state.deferred_seek.take() {
+                        println!("deferred seek");
                         let deferred_seek = {
                             let rowid = {
                                 let mut index_cursor = state.get_cursor(index_cursor_id);
@@ -1479,18 +1476,16 @@ impl Program {
                             let rowid = {
                                 let mut index_cursor = state.get_cursor(index_cursor_id);
                                 let index_cursor = index_cursor.as_btree_mut();
-                                let rowid = index_cursor.rowid()?;
-                                rowid
+                                index_cursor.rowid()?
                             };
                             let mut table_cursor = state.get_cursor(table_cursor_id);
                             let table_cursor = table_cursor.as_btree_mut();
-                            let deferred_seek = match table_cursor
+                            match table_cursor
                                 .seek(SeekKey::TableRowId(rowid.unwrap()), SeekOp::EQ)?
                             {
                                 CursorResult::Ok(_) => None,
                                 CursorResult::IO => Some((index_cursor_id, table_cursor_id)),
-                            };
-                            deferred_seek
+                            }
                         };
                         if let Some(deferred_seek) = deferred_seek {
                             state.deferred_seek = Some(deferred_seek);
@@ -1582,10 +1577,9 @@ impl Program {
                             let cursor = cursor.as_btree_mut();
                             let record_from_regs =
                                 make_record(&state.registers, start_reg, num_regs);
-                            let found = return_if_io!(
+                            return_if_io!(
                                 cursor.seek(SeekKey::IndexKey(&record_from_regs), SeekOp::GE)
-                            );
-                            found
+                            )
                         };
                         if !found {
                             state.pc = target_pc.to_offset_int();
@@ -1626,6 +1620,14 @@ impl Program {
                         };
                         state.pc = pc;
                     }
+                }
+                Insn::SeekEnd { cursor_id } => {
+                    {
+                        let mut cursor = state.get_cursor(*cursor_id);
+                        let cursor = cursor.as_btree_mut();
+                        return_if_io!(cursor.seek_end());
+                    }
+                    state.pc += 1;
                 }
                 Insn::SeekGT {
                     cursor_id,
@@ -1700,7 +1702,7 @@ impl Program {
                             // Compare against the same number of values
                             let ord = compare_immutable(
                                 &idx_record.get_values()[..record_from_regs.len()],
-                                &record_from_regs.get_values(),
+                                record_from_regs.get_values(),
                             );
                             if ord.is_ge() {
                                 target_pc.to_offset_int()
@@ -3194,7 +3196,7 @@ impl Program {
                         };
                         if index_meta.unique {
                             // check for uniqueness violation
-                            match cursor.index_exists(record)? {
+                            match cursor.key_exists_in_index(record)? {
                                 CursorResult::Ok(true) => {
                                     return Err(LimboError::Constraint(
                                         "UNIQUE constraint failed: duplicate key".into(),
@@ -3346,13 +3348,23 @@ impl Program {
                 Insn::OpenWriteAsync {
                     cursor_id,
                     root_page,
+                    is_new_idx,
                 } => {
                     let (_, cursor_type) = self.cursor_ref.get(*cursor_id).unwrap();
                     let mut cursors = state.cursors.borrow_mut();
-                    let is_index = cursor_type.is_index();
+                    let root_page = if *is_new_idx && cursor_type.is_index() {
+                        match state.registers[*root_page].get_owned_value() {
+                            OwnedValue::Integer(i) => *i,
+                            _ => unreachable!(
+                                "Expected root page in register of newly created btree"
+                            ),
+                        }
+                    } else {
+                        *root_page as _
+                    };
                     let mv_cursor = match state.mv_tx_id {
                         Some(tx_id) => {
-                            let table_id = *root_page as u64;
+                            let table_id = root_page as u64;
                             let mv_store = mv_store.as_ref().unwrap().clone();
                             let mv_cursor = Rc::new(RefCell::new(
                                 MvCursor::new(mv_store, tx_id, table_id).unwrap(),
@@ -3361,18 +3373,11 @@ impl Program {
                         }
                         None => None,
                     };
-                    let cursor = BTreeCursor::new(mv_cursor, pager.clone(), *root_page);
-                    if is_index {
-                        cursors
-                            .get_mut(*cursor_id)
-                            .unwrap()
-                            .replace(Cursor::new_btree(cursor));
-                    } else {
-                        cursors
-                            .get_mut(*cursor_id)
-                            .unwrap()
-                            .replace(Cursor::new_btree(cursor));
-                    }
+                    let cursor = BTreeCursor::new(mv_cursor, pager.clone(), root_page as _);
+                    cursors
+                        .get_mut(*cursor_id)
+                        .unwrap()
+                        .replace(Cursor::new_btree(cursor));
                     state.pc += 1;
                 }
                 Insn::OpenWriteAwait {} => {

@@ -36,7 +36,7 @@ impl CmpInsFlags {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct IdxInsertFlags(pub u8);
 impl IdxInsertFlags {
     pub const APPEND: u8 = 0x01; // Hint: insert likely at the end
@@ -437,6 +437,9 @@ pub enum Insn {
         src_reg: usize,
         target_pc: BranchOffset,
     },
+    SeekEnd {
+        cursor_id: CursorID,
+    },
 
     // P1 is an open index cursor and P3 is a cursor on the corresponding table. This opcode does a deferred seek of the P3 table cursor to the row that corresponds to the current row of P1.
     // This is a deferred seek. Nothing actually happens until the cursor is used to read a record. That way, if no reads occur, no unnecessary I/O happens.
@@ -638,6 +641,7 @@ pub enum Insn {
     OpenWriteAsync {
         cursor_id: CursorID,
         root_page: PageIdx,
+        is_new_idx: bool,
     },
 
     OpenWriteAwait {},

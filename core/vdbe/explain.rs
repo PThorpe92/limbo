@@ -760,6 +760,15 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::SeekEnd { cursor_id } => (
+                "SeekEnd",
+                *cursor_id as i32,
+                0,
+                0,
+                OwnedValue::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::IdxInsertAsync {
                 cursor_id,
                 record_reg,
@@ -1121,6 +1130,7 @@ pub fn insn_to_str(
             Insn::OpenWriteAsync {
                 cursor_id,
                 root_page,
+                ..
             } => (
                 "OpenWriteAsync",
                 *cursor_id as i32,
