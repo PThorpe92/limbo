@@ -3193,7 +3193,7 @@ impl Program {
                             _ => return Err(LimboError::InternalError("expected record".into())),
                         };
                         if index_meta.unique {
-                            // check for uniqueness violation. TODO: actually handle async
+                            // check for uniqueness violation
                             match cursor.index_exists(record)? {
                                 CursorResult::Ok(true) => {
                                     return Err(LimboError::Constraint(
@@ -3204,8 +3204,8 @@ impl Program {
                                 CursorResult::Ok(false) => {}
                             }
                         }
-                        // insert record as key, value as empty record
-                        // return_if_io!(cursor.insert(record, &Record::new(vec![]), true));
+                        // insert record as key
+                        return_if_io!(cursor.insert_index_key(record));
                     }
                     state.pc += 1;
                 }

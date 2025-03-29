@@ -69,7 +69,7 @@ pub fn translate_create_index(
     let idx = Arc::new(Index {
         name: idx_name.clone(),
         table_name: tbl.name.to_string(),
-        root_page: 0, // will have to be set later
+        root_page: 0, //  we dont have access till its created, after we parse the schema table
         columns: columns
             .iter()
             .map(|c| IndexColumn {
@@ -79,18 +79,14 @@ pub fn translate_create_index(
             .collect(),
         unique: unique_if_not_exists.0,
     });
-    // open the btree we just created for writing
+    // open the btree we just created for writing, NOTE: we are using an Index
+    // cursor type here, but the root page isn't set until we parse the schema table
     let btree_cursor_id = program.alloc_cursor_id(
         Some(idx_name.to_owned()),
         CursorType::BTreeIndex(idx.clone()),
     );
     program.emit_open_write(root_page_reg, btree_cursor_id);
 
-    // open the table we need to create the index on for reading, so first allocate cursor id
-    let table_cursor_id = program.alloc_cursor_id(
-        Some(tbl_name.to_owned()),
-        CursorType::BTreeTable(tbl.clone()),
-    );
     let pseudo_table = PseudoTable::new_with_columns(tbl.columns.clone());
     let pseudo_cursor_id = program.alloc_cursor_id(None, CursorType::Pseudo(pseudo_table.into()));
 
@@ -115,26 +111,22 @@ pub fn translate_create_index(
 
     // loop over table
     let loop_start_label = program.allocate_label();
-    program.resolve_label(loop_start_label, program.offset());
     let loop_end_label = program.allocate_label();
+    program.resolve_label(loop_start_label, program.offset());
+
+    // open the table we need to create the index on for reading, so first allocate cursor id
+    let table_cursor_id = program.alloc_cursor_id(
+        Some(tbl_name.to_owned()),
+        CursorType::BTreeTable(tbl.clone()),
+    );
     program.emit_open_read(tbl.root_page, table_cursor_id);
-    if matches!(idx.columns.first().unwrap().order, SortOrder::Asc) {
-        program.emit_insn(Insn::RewindAsync {
-            cursor_id: table_cursor_id,
-        });
-        program.emit_insn(Insn::RewindAwait {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-    } else {
-        program.emit_insn(Insn::LastAsync {
-            cursor_id: table_cursor_id,
-        });
-        program.emit_insn(Insn::LastAwait {
-            cursor_id: table_cursor_id,
-            pc_if_empty: loop_end_label,
-        });
-    }
+    program.emit_insn(Insn::RewindAsync {
+        cursor_id: table_cursor_id,
+    });
+    program.emit_insn(Insn::RewindAwait {
+        cursor_id: table_cursor_id,
+        pc_if_empty: loop_end_label,
+    });
 
     // collect index values into start_reg..rowid_reg
     // emit MakeRecord (index key + rowid) into record_reg
