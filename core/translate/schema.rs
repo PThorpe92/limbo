@@ -7,7 +7,6 @@ use crate::translate::ProgramBuilderOpts;
 use crate::translate::QueryMode;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::RegisterOrLiteral;
 use crate::vdbe::insn::{CmpInsFlags, Insn};
 use crate::LimboError;
 use crate::{bail_parse_error, Result};

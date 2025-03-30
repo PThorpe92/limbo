@@ -2017,6 +2017,8 @@ impl BTreeCursor {
             {
                 BTreeCell::IndexInteriorCell(IndexInteriorCell { payload, .. })
                 | BTreeCell::IndexLeafCell(IndexLeafCell { payload, .. }) => {
+                    // TODO: implement efficient comparison of records
+                    // e.g. https://github.com/sqlite/sqlite/blob/master/src/vdbeaux.c#L4719
                     read_record(
                         payload,
                         self.get_immutable_record_or_create().as_mut().unwrap(),
@@ -2027,10 +2029,7 @@ impl BTreeCursor {
                         self.get_immutable_record().as_ref().unwrap().get_values(),
                     );
                     match order {
-                        Ordering::Less => {
-                            break;
-                        }
-                        Ordering::Equal => {
+                        Ordering::Less | Ordering::Equal => {
                             break;
                         }
                         Ordering::Greater => {}
@@ -2044,7 +2043,7 @@ impl BTreeCursor {
     }
 
     pub fn seek_end(&mut self) -> Result<CursorResult<()>> {
-        assert!(self.mv_cursor.is_none());
+        assert!(self.mv_cursor.is_none()); // unsure about this -_-
         self.move_to_root();
         loop {
             let mem_page = self.stack.top();
