@@ -550,6 +550,7 @@ Modifiers:
 | SeekLe         | No     |         |
 | SeekLt         | No     |         |
 | SeekRowid      | Yes    |         |
+| SeekEnd        | Yes    |         |
 | Sequence       | No     |         |
 | SetCookie      | No     |         |
 | ShiftLeft      | Yes    |         |
