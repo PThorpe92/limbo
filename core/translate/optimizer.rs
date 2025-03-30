@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast;
 
 use crate::{
     schema::{Index, Schema},
+    util::exprs_are_equivalent,
     Result,
 };
 
@@ -42,6 +43,8 @@ fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     )?;
 
     eliminate_unnecessary_orderby(plan, schema)?;
+
+    eliminate_orderby_like_groupby(plan)?;
 
     Ok(())
 }
@@ -117,11 +120,61 @@ fn query_is_already_ordered_by(
     }
 }
 
+fn eliminate_orderby_like_groupby(plan: &mut SelectPlan) -> Result<()> {
+    if plan.order_by.is_none() | plan.group_by.is_none() {
+        return Ok(());
+    }
+    if plan.table_references.len() == 0 {
+        return Ok(());
+    }
+
+    let o = plan.order_by.as_mut().unwrap();
+    let g = plan.group_by.as_mut().unwrap();
+
+    let mut insert_pos = 0;
+    let mut i = 0;
+
+    while i < o.len() {
+        let (key, order) = &o[i];
+
+        if matches!(order, Direction::Descending) {
+            i += 1;
+            continue;
+        }
+        if let Some(pos) = g
+            .exprs
+            .iter()
+            .position(|expr| exprs_are_equivalent(expr, key))
+        {
+            if pos != insert_pos {
+                let mut current_pos = pos;
+                while current_pos > insert_pos {
+                    g.exprs.swap(current_pos, current_pos - 1);
+                    current_pos -= 1;
+                }
+            }
+            insert_pos += 1;
+            o.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    if o.is_empty() {
+        plan.order_by = None
+    }
+    Ok(())
+}
+
 fn eliminate_unnecessary_orderby(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     if plan.order_by.is_none() {
         return Ok(());
     }
     if plan.table_references.is_empty() {
+        return Ok(());
+    }
+
+    // if pk will be removed later
+    if plan.group_by.is_some() {
         return Ok(());
     }
 

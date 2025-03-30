@@ -6,6 +6,7 @@ use crate::{
     function::AggFunc,
     schema::{Column, PseudoTable},
     types::{OwnedValue, Record},
+    util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::Insn,
@@ -711,27 +712,7 @@ pub fn translate_aggregation_step_groupby(
 }
 
 pub fn is_column_in_group_by(expr: &ast::Expr, group_by_exprs: &[ast::Expr]) -> bool {
-    if let ast::Expr::Column {
-        database: _,
-        table: _,
-        column: col,
-        is_rowid_alias: _,
-    } = expr
-    {
-        group_by_exprs.iter().any(|ex| {
-            if let ast::Expr::Column {
-                database: _,
-                table: _,
-                column: group_col,
-                is_rowid_alias: _,
-            } = ex
-            {
-                col == group_col
-            } else {
-                false
-            }
-        })
-    } else {
-        false
-    }
+    group_by_exprs
+        .iter()
+        .any(|expr2| exprs_are_equivalent(expr, expr2))
 }
