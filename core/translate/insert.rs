@@ -9,6 +9,7 @@ use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::Table;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
+use crate::vdbe::insn::RegisterOrLiteral;
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -152,8 +153,7 @@ pub fn translate_insert(
 
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
-            root_page,
-            is_new_idx: false,
+            root_page: RegisterOrLiteral::Literal(root_page),
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -169,8 +169,7 @@ pub fn translate_insert(
         // Single row - populate registers directly
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
-            root_page,
-            is_new_idx: false,
+            root_page: RegisterOrLiteral::Literal(root_page),
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 

@@ -7,6 +7,7 @@ use crate::translate::ProgramBuilderOpts;
 use crate::translate::QueryMode;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
+use crate::vdbe::insn::RegisterOrLiteral;
 use crate::vdbe::insn::{CmpInsFlags, Insn};
 use crate::LimboError;
 use crate::{bail_parse_error, Result};
@@ -103,8 +104,7 @@ pub fn translate_create_table(
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
-        is_new_idx: false,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -501,8 +501,7 @@ pub fn translate_create_virtual_table(
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
-        is_new_idx: false,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -581,8 +580,7 @@ pub fn translate_drop_table(
     );
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: 1,
-        is_new_idx: false,
+        root_page: 1usize.into(),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 

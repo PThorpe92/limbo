@@ -76,6 +76,18 @@ impl IdxInsertFlags {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum RegisterOrLiteral<T: Copy> {
+    Register(usize),
+    Literal(T),
+}
+
+impl From<PageIdx> for RegisterOrLiteral<PageIdx> {
+    fn from(value: PageIdx) -> Self {
+        RegisterOrLiteral::Literal(value)
+    }
+}
+
 #[derive(Description, Debug)]
 pub enum Insn {
     /// Initialize the program state and jump to the given PC.
@@ -640,8 +652,7 @@ pub enum Insn {
 
     OpenWriteAsync {
         cursor_id: CursorID,
-        root_page: PageIdx,
-        is_new_idx: bool,
+        root_page: RegisterOrLiteral<PageIdx>,
     },
 
     OpenWriteAwait {},
@@ -1272,8 +1283,6 @@ impl Insn {
             Insn::IdxGT { .. } => execute::op_idx_gt,
             Insn::IdxLE { .. } => execute::op_idx_le,
             Insn::IdxLT { .. } => execute::op_idx_lt,
-            Insn::IdxInsertAsync { .. } => execute::op_idx_insert_async,
-            Insn::IdxInsertAwait { .. } => execute::op_idx_insert_await,
             Insn::DecrJumpZero { .. } => execute::op_decr_jump_zero,
             Insn::AggStep { .. } => execute::op_agg_step,
             Insn::AggFinal { .. } => execute::op_agg_final,
@@ -1288,6 +1297,8 @@ impl Insn {
             Insn::Yield { .. } => execute::op_yield,
             Insn::InsertAsync { .. } => execute::op_insert_async,
             Insn::InsertAwait { .. } => execute::op_insert_await,
+            Insn::IdxInsertAsync { .. } => execute::op_idx_insert_async,
+            Insn::IdxInsertAwait { .. } => execute::op_idx_insert_await,
             Insn::DeleteAsync { .. } => execute::op_delete_async,
             Insn::DeleteAwait { .. } => execute::op_delete_await,
             Insn::NewRowid { .. } => execute::op_new_rowid,

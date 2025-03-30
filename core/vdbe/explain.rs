@@ -1,4 +1,4 @@
-use crate::vdbe::builder::CursorType;
+use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 
 use super::{Insn, InsnReference, OwnedValue, Program};
 use crate::function::{Func, ScalarFunc};
@@ -1134,7 +1134,10 @@ pub fn insn_to_str(
             } => (
                 "OpenWriteAsync",
                 *cursor_id as i32,
-                *root_page as i32,
+                match root_page {
+                    RegisterOrLiteral::Literal(i) => *i as _,
+                    RegisterOrLiteral::Register(i) => *i as _,
+                },
                 0,
                 OwnedValue::build_text(""),
                 0,

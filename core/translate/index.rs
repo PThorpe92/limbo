@@ -6,7 +6,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder, QueryMode},
-        insn::{IdxInsertFlags, Insn},
+        insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
     },
     OwnedValue,
 };
@@ -97,8 +97,7 @@ pub fn translate_create_index(
     // open the sqlite schema table for writing and create a new entry for the index
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: sqlite_schema_cursor_id,
-        root_page: sqlite_table.root_page,
-        is_new_idx: false,
+        root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
     let sql = create_idx_stmt_to_sql(&tbl_name, &idx_name, unique_if_not_exists, &columns);
@@ -197,8 +196,7 @@ pub fn translate_create_index(
     // newly sorted index records.
     program.emit_insn(Insn::OpenWriteAsync {
         cursor_id: btree_cursor_id,
-        root_page: root_page_reg,
-        is_new_idx: true,
+        root_page: RegisterOrLiteral::Register(root_page_reg),
     });
     program.emit_insn(Insn::OpenWriteAwait {});
 
