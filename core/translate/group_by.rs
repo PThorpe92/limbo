@@ -50,15 +50,22 @@ pub fn init_group_by(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     group_by: &GroupBy,
-    aggregates: &[Aggregate],
+    plan: &SelectPlan,
 ) -> Result<()> {
-    let num_aggs = aggregates.len();
+    let num_aggs = plan.aggregates.len();
+
+    // Calculate this count only once
+    let non_aggregate_count = plan
+        .result_columns
+        .iter()
+        .filter(|rc| !rc.contains_aggregates)
+        .count();
 
     let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
 
     let reg_abort_flag = program.alloc_register();
     let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
-    let reg_group_exprs_acc = program.alloc_registers(group_by.exprs.len());
+    let reg_group_exprs_acc = program.alloc_registers(non_aggregate_count);
     let reg_agg_exprs_start = program.alloc_registers(num_aggs);
     let reg_sorter_key = program.alloc_register();
 
@@ -71,7 +78,7 @@ pub fn init_group_by(
     }
     program.emit_insn(Insn::SorterOpen {
         cursor_id: sort_cursor,
-        columns: aggregates.len() + group_by.exprs.len(),
+        columns: non_aggregate_count + plan.aggregates.len(),
         order: Record::new(order),
     });
 
@@ -156,14 +163,23 @@ pub fn emit_group_by<'a>(
 
     let group_by = plan.group_by.as_ref().unwrap();
 
+    // Calculate these values once
+    let non_aggregate_count = plan
+        .result_columns
+        .iter()
+        .filter(|rc| !rc.contains_aggregates)
+        .count();
+
+    let agg_args_count = plan
+        .aggregates
+        .iter()
+        .map(|agg| agg.args.len())
+        .sum::<usize>();
+
     // all group by columns and all arguments of agg functions are in the sorter.
     // the sort keys are the group by columns (the aggregation within groups is done based on how long the sort keys remain the same)
-    let sorter_column_count = group_by.exprs.len()
-        + plan
-            .aggregates
-            .iter()
-            .map(|agg| agg.args.len())
-            .sum::<usize>();
+    let sorter_column_count = non_aggregate_count + agg_args_count;
+
     // sorter column names do not matter
     let ty = crate::schema::Type::Null;
     let pseudo_columns = (0..sorter_column_count)
@@ -238,11 +254,6 @@ pub fn emit_group_by<'a>(
     });
 
     // New group, move current group by columns into the comparison register
-    program.emit_insn(Insn::Move {
-        source_reg: groups_start_reg,
-        dest_reg: reg_group_exprs_cmp,
-        count: group_by.exprs.len(),
-    });
 
     program.add_comment(
         program.offset(),
@@ -251,6 +262,12 @@ pub fn emit_group_by<'a>(
     program.emit_insn(Insn::Gosub {
         target_pc: label_subrtn_acc_output,
         return_reg: reg_subrtn_acc_output_return_offset,
+    });
+
+    program.emit_insn(Insn::Move {
+        source_reg: groups_start_reg,
+        dest_reg: reg_group_exprs_cmp,
+        count: group_by.exprs.len(),
     });
 
     program.add_comment(program.offset(), "check abort flag");
@@ -269,7 +286,7 @@ pub fn emit_group_by<'a>(
     // Accumulate the values into the aggregations
     program.resolve_label(agg_step_label, program.offset());
     let start_reg = t_ctx.reg_agg_start.unwrap();
-    let mut cursor_index = group_by.exprs.len();
+    let mut cursor_index = non_aggregate_count;
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = start_reg + i;
         translate_aggregation_step_groupby(
@@ -296,7 +313,7 @@ pub fn emit_group_by<'a>(
     });
 
     // Read the group by columns for a finished group
-    for i in 0..group_by.exprs.len() {
+    for i in 0..non_aggregate_count {
         let key_reg = reg_group_exprs_acc + i;
         let sorter_column_index = i;
         program.emit_insn(Insn::Column {
@@ -363,6 +380,12 @@ pub fn emit_group_by<'a>(
         });
     }
 
+    // Cache expressions we need multiple times
+    let filtered_results = plan
+        .result_columns
+        .iter()
+        .filter(|rc| !rc.contains_aggregates)
+        .collect::<Vec<_>>();
     // we now have the group by columns in registers (group_exprs_start_register..group_exprs_start_register + group_by.len() - 1)
     // and the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
@@ -372,6 +395,24 @@ pub fn emit_group_by<'a>(
             .resolver
             .expr_to_reg_cache
             .push((expr, reg_group_exprs_acc + i));
+    }
+
+    // Offset for the next expressions after group_by
+    let mut offset = group_by.exprs.len();
+
+    for rc in filtered_results.iter() {
+        let expr = &rc.expr;
+
+        // skip cols that are already in group by
+        if !matches!(expr, ast::Expr::Column { .. })
+            || !is_column_in_group_by(expr, &group_by.exprs)
+        {
+            t_ctx
+                .resolver
+                .expr_to_reg_cache
+                .push((expr, reg_group_exprs_acc + offset));
+            offset += 1;
+        }
     }
     for (i, agg) in plan.aggregates.iter().enumerate() {
         t_ctx
@@ -420,7 +461,7 @@ pub fn emit_group_by<'a>(
     let start_reg = reg_group_exprs_acc;
     program.emit_insn(Insn::Null {
         dest: start_reg,
-        dest_end: Some(start_reg + group_by.exprs.len() + plan.aggregates.len() - 1),
+        dest_end: Some(start_reg + non_aggregate_count + plan.aggregates.len() - 1),
     });
 
     program.emit_insn(Insn::Integer {
@@ -667,4 +708,30 @@ pub fn translate_aggregation_step_groupby(
         }
     };
     Ok(dest)
+}
+
+pub fn is_column_in_group_by(expr: &ast::Expr, group_by_exprs: &[ast::Expr]) -> bool {
+    if let ast::Expr::Column {
+        database: _,
+        table: _,
+        column: col,
+        is_rowid_alias: _,
+    } = expr
+    {
+        group_by_exprs.iter().any(|ex| {
+            if let ast::Expr::Column {
+                database: _,
+                table: _,
+                column: group_col,
+                is_rowid_alias: _,
+            } = ex
+            {
+                col == group_col
+            } else {
+                false
+            }
+        })
+    } else {
+        false
+    }
 }

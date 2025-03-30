@@ -262,8 +262,8 @@ pub fn emit_query<'a>(
         init_order_by(program, t_ctx, order_by)?;
     }
 
-    if let Some(ref mut group_by) = plan.group_by {
-        init_group_by(program, t_ctx, group_by, &plan.aggregates)?;
+    if let Some(ref group_by) = plan.group_by {
+        init_group_by(program, t_ctx, group_by, &plan)?;
     }
     init_loop(
         program,

@@ -15,6 +15,7 @@ use super::{
     aggregation::translate_aggregation_step,
     emitter::{OperationMode, TranslateCtx},
     expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    group_by::is_column_in_group_by,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         IterationDirection, Operation, Search, SelectPlan, SelectQueryType, TableReference,
@@ -599,7 +600,12 @@ fn emit_loop_source(
         LoopEmitTarget::GroupBySorter => {
             let group_by = plan.group_by.as_ref().unwrap();
             let aggregates = &plan.aggregates;
-            let sort_keys_count = group_by.exprs.len();
+            let non_aggregate_columns = plan
+                .result_columns
+                .iter()
+                .filter(|rc| !rc.contains_aggregates)
+                .collect::<Vec<_>>();
+            let sort_keys_count = non_aggregate_columns.len();
             let aggregate_arguments_count = plan
                 .aggregates
                 .iter()
@@ -621,6 +627,25 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
+
+            if group_by.exprs.len() + aggregates.len() != plan.result_columns.len() {
+                for rc in non_aggregate_columns.iter() {
+                    let expr = &rc.expr;
+                    if !is_column_in_group_by(expr, &group_by.exprs) {
+                        let key_reg = cur_reg;
+                        cur_reg += 1;
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            expr,
+                            key_reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
+                }
+            }
+            // Process non-aggregate result columns that aren't already in group_by
+
             // Then we have the aggregate arguments.
             for agg in aggregates.iter() {
                 // Here we are collecting scalars for the group by sorter, which will include
@@ -692,14 +717,14 @@ fn emit_loop_source(
 
             let col_start = t_ctx.reg_result_cols_start.unwrap();
 
-            for (i, rc) in plan.result_columns.iter().enumerate() {
-                if rc.contains_aggregates {
-                    // Do nothing, aggregates are computed above
-                    // if this result column is e.g. something like sum(x) + 1 or length(sum(x)), we do not want to translate that (+1) or length() yet,
-                    // it will be computed after the aggregations are finalized.
-                    continue;
-                }
+            // Process only non-aggregate columns
+            let non_agg_columns = plan
+                .result_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, rc)| !rc.contains_aggregates);
 
+            for (i, rc) in non_agg_columns {
                 let reg = col_start + i;
 
                 translate_expr(
