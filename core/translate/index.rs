@@ -62,13 +62,13 @@ pub fn translate_create_index(
         unique: unique_if_not_exists.0,
     });
 
-    // Allocate the necessary cursors.
+    // Allocate the necessary cursors:
     //
-    // 1. sqlite_schema_cursor_id - for the sqlite_schema table
-    // 2. btree_cursor_id - for the index btree
-    // 3. table_cursor_id - for the table we are creating the index on
-    // 4. sorter_cursor_id - for the sorter
-    // 5. pseudo_cursor_id - for the pseudo table to store the sorted index values
+    // 1. sqlite_schema_cursor_id - sqlite_schema table
+    // 2. btree_cursor_id         - new index btree
+    // 3. table_cursor_id         - table we are creating the index on
+    // 4. sorter_cursor_id        - sorter
+    // 5. pseudo_cursor_id        - pseudo table to store the sorted index values
     let sqlite_table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(
         Some(SQLITE_TABLEID.to_owned()),
@@ -292,7 +292,7 @@ fn create_idx_stmt_to_sql(
     unique_if_not_exists: (bool, bool),
     cols: &[((usize, &Column), SortOrder)],
 ) -> String {
-    let mut sql = String::new();
+    let mut sql = String::with_capacity(128);
     sql.push_str("CREATE ");
     if unique_if_not_exists.0 {
         sql.push_str("UNIQUE ");

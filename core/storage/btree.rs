@@ -2501,22 +2501,28 @@ impl BTreeCursor {
     /// Search for a key in an Index Btree. Looking up indexes that need to be unique, we cannot compare the rowid
     pub fn key_exists_in_index(&mut self, key: &ImmutableRecord) -> Result<CursorResult<bool>> {
         return_if_io!(self.do_seek(SeekKey::IndexKey(key), SeekOp::GE));
-        if let Some(record) = self.record().as_ref() {
-            // get existing record, excluding the rowid
-            assert!(record.len() > 0);
-            let existing_key = &record.get_values()[..record.count() - 1];
-            let inserted_key_vals = &key.get_values();
-            if existing_key
-                .iter()
-                .zip(inserted_key_vals.iter())
-                .all(|(a, b)| a == b)
-            {
-                return Ok(CursorResult::Ok(true)); // duplicate
+
+        let record_opt = self.record();
+        match record_opt.as_ref() {
+            Some(record) => {
+                // Existing record found — compare prefix
+                let existing_key = &record.get_values()[..record.count().saturating_sub(1)];
+                let inserted_key_vals = &key.get_values();
+                if existing_key
+                    .iter()
+                    .zip(inserted_key_vals.iter())
+                    .all(|(a, b)| a == b)
+                {
+                    return Ok(CursorResult::Ok(true)); // duplicate
+                }
             }
-        } else {
-            return Err(LimboError::InvalidArgument("Expected Record key".into()));
+            None => {
+                // Cursor not pointing at a record — table is empty or past last
+                return Ok(CursorResult::Ok(false));
+            }
         }
-        Ok(CursorResult::Ok(false)) // no matching key found
+
+        Ok(CursorResult::Ok(false)) // not a duplicate
     }
 
     pub fn exists(&mut self, key: &OwnedValue) -> Result<CursorResult<bool>> {
