@@ -153,6 +153,7 @@ pub fn translate_insert(
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
             root_page,
+            is_new_idx: false,
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 
@@ -169,6 +170,7 @@ pub fn translate_insert(
         program.emit_insn(Insn::OpenWriteAsync {
             cursor_id,
             root_page,
+            is_new_idx: false,
         });
         program.emit_insn(Insn::OpenWriteAwait {});
 

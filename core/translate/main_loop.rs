@@ -103,6 +103,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id,
                             root_page,
+                            is_new_idx: false,
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -111,6 +112,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id,
                             root_page,
+                            is_new_idx: false,
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -145,6 +147,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page(),
+                            is_new_idx: false,
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -152,6 +155,7 @@ pub fn init_loop(
                         program.emit_insn(Insn::OpenWriteAsync {
                             cursor_id: table_cursor_id,
                             root_page: table.table.get_root_page(),
+                            is_new_idx: false,
                         });
                         program.emit_insn(Insn::OpenWriteAwait {});
                     }
@@ -178,6 +182,7 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenWriteAsync {
                                 cursor_id: index_cursor_id,
                                 root_page: index.root_page,
+                                is_new_idx: false,
                             });
                             program.emit_insn(Insn::OpenWriteAwait {});
                         }
@@ -185,6 +190,7 @@ pub fn init_loop(
                             program.emit_insn(Insn::OpenWriteAsync {
                                 cursor_id: index_cursor_id,
                                 root_page: index.root_page,
+                                is_new_idx: false,
                             });
                             program.emit_insn(Insn::OpenWriteAwait {});
                         }
