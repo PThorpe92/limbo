@@ -2161,13 +2161,15 @@ impl BTreeCursor {
             },
             None => {
                 if !moved_before {
-                    return_if_io!(self.move_to(
-                        match key {
-                            BTreeKey::IndexKey(_) => SeekKey::IndexKey(key.get_record().unwrap()),
-                            BTreeKey::TableRowId(_) => SeekKey::TableRowId(key.to_rowid()),
-                        },
-                        SeekOp::EQ
-                    ));
+                    match key {
+                        BTreeKey::IndexKey(_) => {
+                            return_if_io!(self
+                                .move_to(SeekKey::IndexKey(key.get_record().unwrap()), SeekOp::GE))
+                        }
+                        BTreeKey::TableRowId(_) => return_if_io!(
+                            self.move_to(SeekKey::TableRowId(key.to_rowid()), SeekOp::EQ)
+                        ),
+                    }
                 }
                 return_if_io!(self.insert_into_page(key));
                 if key.maybe_rowid().is_some() {
