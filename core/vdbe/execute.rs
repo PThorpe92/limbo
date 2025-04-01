@@ -14,7 +14,7 @@ use std::{borrow::BorrowMut, rc::Rc};
 use crate::pseudo::PseudoCursor;
 use crate::result::LimboResult;
 use crate::schema::{affinity, Affinity};
-use crate::storage::btree::BTreeCursor;
+use crate::storage::btree::{BTreeCursor, BTreeKey};
 use crate::storage::wal::CheckpointResult;
 use crate::types::{
     AggContext, Cursor, CursorResult, ExternalAggState, OwnedValue, SeekKey, SeekOp,
@@ -3679,11 +3679,14 @@ pub fn op_insert_async(
             Register::Record(r) => r,
             _ => unreachable!("Not a record! Cannot insert a non record value."),
         };
-        let key = &state.registers[*key_reg];
+        let key = match &state.registers[*key_reg].get_owned_value() {
+            OwnedValue::Integer(i) => *i,
+            _ => unreachable!("expected integer key"),
+        };
         // NOTE(pere): Sending moved_before == true is okay because we moved before but
         // if we were to set to false after starting a balance procedure, it might
         // leave undefined state.
-        return_if_io!(cursor.insert(key.get_owned_value(), record, true));
+        return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key as u64, Some(record)), true));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3778,7 +3781,7 @@ pub fn op_idx_insert_async(
                 flags.has(IdxInsertFlags::USE_SEEK)
             };
             // insert record as key
-            return_if_io!(cursor.insert_index_key(record));
+            return_if_io!(cursor.insert(&BTreeKey::new_index_key(record), moved_before));
         }
         state.pc += 1;
     }
