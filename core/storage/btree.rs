@@ -177,13 +177,19 @@ pub enum BTreeKey<'a> {
     IndexKey(&'a ImmutableRecord),
 }
 
-impl<'a> BTreeKey<'_> {
-    pub fn new_table_rowid(rowid: u64, record: Option<&'a ImmutableRecord>) -> BTreeKey<'a> {
+impl BTreeKey<'_> {
+    /// Create a new table rowid key from a rowid and an optional immutable record.
+    /// The record is optional because it may not be available when the key is created.
+    pub fn new_table_rowid(rowid: u64, record: Option<&ImmutableRecord>) -> BTreeKey<'_> {
         BTreeKey::TableRowId((rowid, record))
     }
-    pub fn new_index_key(record: &'a ImmutableRecord) -> BTreeKey<'a> {
+
+    /// Create a new index key from an immutable record.
+    pub fn new_index_key(record: &ImmutableRecord) -> BTreeKey<'_> {
         BTreeKey::IndexKey(record)
     }
+
+    /// Get the record, if present. Index will always be present,
     fn get_record(&self) -> Option<&'_ ImmutableRecord> {
         match self {
             BTreeKey::TableRowId((_, record)) => *record,
@@ -191,6 +197,7 @@ impl<'a> BTreeKey<'_> {
         }
     }
 
+    /// Get the rowid, if present. Index will never be present.
     fn maybe_rowid(&self) -> Option<u64> {
         match self {
             BTreeKey::TableRowId((rowid, _)) => Some(*rowid),
@@ -198,18 +205,18 @@ impl<'a> BTreeKey<'_> {
         }
     }
 
-    /// Assert that the key is a rowid and return it.
+    /// Assert that the key is an integer rowid and return it.
     fn to_rowid(&self) -> u64 {
         match self {
             BTreeKey::TableRowId((rowid, _)) => *rowid,
-            BTreeKey::IndexKey(_) => panic!("BTreeKey::assert_rowid() called on IndexKey"),
+            BTreeKey::IndexKey(_) => panic!("BTreeKey::to_rowid called on IndexKey"),
         }
     }
 
     /// Assert that the key is an index key and return it.
     fn to_index_key_values(&self) -> &'_ Vec<RefValue> {
         match self {
-            BTreeKey::TableRowId(_) => panic!("BTreeKey::assert_index_key() called on TableRowId"),
+            BTreeKey::TableRowId(_) => panic!("BTreeKey::to_index_key called on TableRowId"),
             BTreeKey::IndexKey(key) => key.get_values(),
         }
     }
