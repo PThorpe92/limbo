@@ -4196,7 +4196,7 @@ mod tests {
             for (key, size) in sequence.iter() {
                 run_until_done(
                     || {
-                        let key = SeekKey::TableRowId(*key as u64);
+                        let key = SeekKey::TableRowId(*key);
                         cursor.move_to(key, SeekOp::EQ)
                     },
                     pager.deref(),
@@ -4217,7 +4217,7 @@ mod tests {
                 );
             }
             for (key, _) in sequence.iter() {
-                let seek_key = SeekKey::TableRowId(*key as u64);
+                let seek_key = SeekKey::TableRowId(*key);
                 assert!(
                     matches!(
                         cursor.seek(seek_key, SeekOp::EQ).unwrap(),
@@ -5166,7 +5166,6 @@ mod tests {
         for i in 0..10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let key = OwnedValue::Integer(i);
             let value =
                 ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Integer(i))]);
             tracing::trace!("before insert {}", i);
@@ -5246,7 +5245,6 @@ mod tests {
         // Insert 10,000 records in to the BTree.
         for i in 1..=10000 {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
-            let key = OwnedValue::Integer(i);
             let value = ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(
                 Text::new("hello world"),
             ))]);
@@ -5323,7 +5321,6 @@ mod tests {
         for i in 0..iterations {
             let mut cursor = BTreeCursor::new(None, pager.clone(), root_page);
             tracing::info!("INSERT INTO t VALUES ({});", i,);
-            let key = OwnedValue::Integer(i as i64);
             let value =
                 ImmutableRecord::from_registers(&[Register::OwnedValue(OwnedValue::Text(Text {
                     value: huge_texts[i].as_bytes().to_vec(),
