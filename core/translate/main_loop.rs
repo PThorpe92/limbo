@@ -628,6 +628,7 @@ fn emit_loop_source(
                 )?;
             }
 
+            // Process non-aggregate result columns that aren't already in group_by
             if group_by.exprs.len() + aggregates.len() != plan.result_columns.len() {
                 for rc in non_aggregate_columns.iter() {
                     let expr = &rc.expr;
@@ -644,7 +645,6 @@ fn emit_loop_source(
                     }
                 }
             }
-            // Process non-aggregate result columns that aren't already in group_by
 
             // Then we have the aggregate arguments.
             for agg in aggregates.iter() {
@@ -703,7 +703,7 @@ fn emit_loop_source(
                 )?;
             }
 
-            let if_label = if let Some(flag) = t_ctx.reg_agg_flag {
+            let label_emit_nonagg_only_once = if let Some(flag) = t_ctx.reg_nonagg_emit_once_flag {
                 let if_label = program.allocate_label();
                 program.emit_insn(Insn::If {
                     reg: flag,
@@ -735,9 +735,9 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
-            if let Some(label) = if_label {
+            if let Some(label) = label_emit_nonagg_only_once {
                 program.resolve_label(label, program.offset());
-                let flag = t_ctx.reg_agg_flag.unwrap();
+                let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();
                 program.emit_int(1, flag);
             }
 

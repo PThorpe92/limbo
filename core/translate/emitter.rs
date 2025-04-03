@@ -62,8 +62,10 @@ pub struct TranslateCtx<'a> {
     pub label_main_loop_end: Option<BranchOffset>,
     // First register of the aggregation results
     pub reg_agg_start: Option<usize>,
-    // Register to track if we set non aggregate cols to first encountered row in non group by agg statement
-    pub reg_agg_flag: Option<usize>,
+    // In non-group-by statements with aggregations (e.g. SELECT foo, bar, sum(baz) FROM t),
+    // we want to emit the non-aggregate columns (foo and bar) only once.
+    // This register is a flag that tracks whether we have already done that.
+    pub reg_nonagg_emit_once_flag: Option<usize>,
     // First register of the result columns of the query
     pub reg_result_cols_start: Option<usize>,
     // The register holding the limit value, if any.
@@ -117,7 +119,7 @@ fn prologue<'a>(
         labels_main_loop: (0..table_count).map(|_| LoopLabels::new(program)).collect(),
         label_main_loop_end: None,
         reg_agg_start: None,
-        reg_agg_flag: None,
+        reg_nonagg_emit_once_flag: None,
         reg_limit: None,
         reg_offset: None,
         reg_limit_offset_sum: None,
@@ -251,7 +253,7 @@ pub fn emit_query<'a>(
     {
         let flag = program.alloc_register();
         program.emit_int(0, flag);
-        t_ctx.reg_agg_flag = Some(flag);
+        t_ctx.reg_nonagg_emit_once_flag = Some(flag);
     }
 
     // Allocate registers for result columns
