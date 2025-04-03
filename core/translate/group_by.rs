@@ -174,9 +174,6 @@ pub fn emit_group_by<'a>(
         .sum::<usize>();
     let group_by_count = group_by.exprs.len();
     let non_group_by_non_agg_column_count = non_group_by_non_agg_column_count.unwrap();
-    // Count of GROUP BY columns that appear in the result set
-    let group_by_colls_in_result_set =
-        plan.result_columns.len() - non_group_by_non_agg_column_count - plan.aggregates.len();
 
     // We have to know which group by expr present in resulting set
     let group_by_expr_in_res_cols: Vec<bool> = group_by
@@ -492,10 +489,7 @@ pub fn emit_group_by<'a>(
     program.emit_insn(Insn::Null {
         dest: start_reg,
         dest_end: Some(
-            start_reg
-                + non_group_by_non_agg_column_count
-                + group_by_colls_in_result_set
-                + plan.aggregates.len()
+            start_reg + non_group_by_non_agg_column_count + group_by_count + plan.aggregates.len()
                 - 1,
         ),
     });
