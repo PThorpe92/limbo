@@ -151,17 +151,21 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
             })
             .collect()
     });
+    // Parse the WHERE clause
     parse_where(
         body.where_clause.as_ref().map(|w| *w.clone()),
         &table_references,
         Some(&result_columns),
         &mut where_clause,
     )?;
+
+    // Parse the LIMIT/OFFSET clause
     let (limit, offset) = body
         .limit
         .as_ref()
-        .map(|l| parse_limit(*l.clone()))
+        .map(|l| parse_limit(l))
         .unwrap_or(Ok((None, None)))?;
+
     Ok(Plan::Update(UpdatePlan {
         table_references,
         set_clauses,
