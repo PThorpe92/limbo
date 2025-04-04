@@ -462,7 +462,8 @@ pub fn translate_create_virtual_table(
         approx_num_insns: 40,
         approx_num_labels: 2,
     });
-
+    let init_label = program.emit_init();
+    let start_offset = program.offset();
     let module_name_reg = program.emit_string8_new_reg(module_name_str.clone());
     let table_name_reg = program.emit_string8_new_reg(table_name.clone());
 
@@ -520,8 +521,6 @@ pub fn translate_create_virtual_table(
         where_clause: parse_schema_where_clause,
     });
 
-    let init_label = program.emit_init();
-    let start_offset = program.offset();
     program.emit_halt();
     program.resolve_label(init_label, program.offset());
     program.emit_transaction(true);

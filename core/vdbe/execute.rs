@@ -4116,7 +4116,7 @@ pub fn op_parse_schema(
     let conn = program.connection.upgrade();
     let conn = conn.as_ref().unwrap();
     let stmt = conn.prepare(format!(
-        "SELECT * FROM  sqlite_schema WHERE {}",
+        "SELECT * FROM sqlite_schema WHERE {}",
         where_clause
     ))?;
     let mut schema = conn.schema.write();
