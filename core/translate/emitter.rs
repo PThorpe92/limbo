@@ -491,7 +491,7 @@ fn emit_program_for_update(
         &plan.table_references,
         &plan.where_clause,
     )?;
-    emit_update_insns(&plan, &mut t_ctx, program)?;
+    emit_update_insns(&plan, &t_ctx, program)?;
     close_loop(program, &mut t_ctx, &plan.table_references)?;
 
     program.resolve_label(after_main_loop_label, program.offset());
@@ -505,7 +505,7 @@ fn emit_program_for_update(
 
 fn emit_update_insns(
     plan: &UpdatePlan,
-    t_ctx: &mut TranslateCtx,
+    t_ctx: &TranslateCtx,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let table_ref = &plan.table_references.first().unwrap();
