@@ -107,6 +107,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
         mut line: &str,
         mut pos: usize,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // TODO maybe check to see if the line is empty and then just output the command names
         line = &line[1..];
         pos = pos - 1;
 
