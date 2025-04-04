@@ -52,8 +52,8 @@ impl IO for MemoryIO {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
-    fn get_memory_io(&self) -> Option<Arc<MemoryIO>> {
-        None
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

@@ -93,7 +93,7 @@ impl IO for SimulatorIO {
         "2024-01-01 00:00:00".to_string()
     }
 
-    fn get_memory_io(&self) -> Option<Arc<limbo_core::MemoryIO>> {
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
         todo!()
     }
 }

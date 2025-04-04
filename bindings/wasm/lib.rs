@@ -297,8 +297,8 @@ impl limbo_core::IO for PlatformIO {
         date.toISOString()
     }
 
-    fn get_memory_io(&self) -> Option<Arc<limbo_core::MemoryIO>> {
-        None // TODO: Make sure if memory isn't needed here
+    fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
+        Arc::new(limbo_core::MemoryIO::new())
     }
 }
 

@@ -27,7 +27,9 @@ use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::Insn;
 use crate::vector::{vector32, vector64, vector_distance_cos, vector_extract};
 
-use crate::{info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState};
+use crate::{
+    info, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult, TransactionState, IO,
+};
 
 use super::insn::{
     exec_add, exec_and, exec_bit_and, exec_bit_not, exec_bit_or, exec_boolean_not, exec_concat,
@@ -4329,11 +4331,7 @@ pub fn op_open_ephemeral(
     };
 
     let conn = program.connection.upgrade().unwrap();
-    // Only memory and vfs IOs returns None, so cloning is safe
-    let io = match conn.pager.io.get_memory_io() {
-        Some(io) => io,
-        None => conn.pager.io.clone(),
-    };
+    let io = conn.pager.io.get_memory_io();
 
     let file = io.open_file("", OpenFlags::Create, true)?;
     let page_io = Arc::new(FileMemoryStorage::new(file));

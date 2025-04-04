@@ -43,7 +43,7 @@ pub trait IO: Send + Sync {
 
     fn get_current_time(&self) -> String;
 
-    fn get_memory_io(&self) -> Option<Arc<MemoryIO>>;
+    fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);

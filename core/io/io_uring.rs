@@ -34,7 +34,6 @@ impl fmt::Display for UringIOError {
 
 pub struct UringIO {
     inner: Rc<RefCell<InnerUringIO>>,
-    memory_io: Arc<MemoryIO>,
 }
 
 unsafe impl Send for UringIO {}
@@ -78,7 +77,6 @@ impl UringIO {
         debug!("Using IO backend 'io-uring'");
         Ok(Self {
             inner: Rc::new(RefCell::new(inner)),
-            memory_io: Arc::new(MemoryIO::new()),
         })
     }
 }
@@ -203,8 +201,8 @@ impl IO for UringIO {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
     
-    fn get_memory_io(&self) -> Option<Arc<MemoryIO>> {
-        Some(self.memory_io.clone())
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 

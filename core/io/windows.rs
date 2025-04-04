@@ -5,14 +5,12 @@ use std::sync::Arc;
 use tracing::{debug, trace};
 use super::MemoryIO;
 pub struct WindowsIO {
-    memory_io: Arc<MemoryIO>,
 }
 
 impl WindowsIO {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'syscall'");
         Ok(Self {
-            memory_io: Arc::new(MemoryIO::new()),
         })
     }
 }
@@ -47,8 +45,8 @@ impl IO for WindowsIO {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
     }
   
-    fn get_memory_io(&self) -> Option<Arc<MemoryIO>> {
-        Some(self.memory_io.clone())
+    fn get_memory_io(&self) -> Arc<MemoryIO> {
+        Arc::new(MemoryIO::new())
     }
 }
 
