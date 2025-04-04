@@ -142,10 +142,7 @@ impl<C: Parser + Send + Sync + 'static> SqlCompleter<C> {
 
                 Ok((prefix_pos + 1, candidates))
             }
-            Err(e) => {
-                tracing::error!("Dot completion error: {e}");
-                Ok((prefix_pos + 1, Vec::new()))
-            }
+            Err(_) => Ok((prefix_pos + 1, Vec::new())),
         }
     }
 
