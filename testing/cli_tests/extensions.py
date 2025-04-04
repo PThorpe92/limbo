@@ -338,7 +338,10 @@ def test_series():
 
 def test_kv():
     ext_path = "target/debug/liblimbo_ext_tests"
-    limbo = TestLimboShell("")
+    limbo = TestLimboShell()
+    # first, create a normal table to ensure no issues
+    limbo.execute_dot("CREATE TABLE other (a,b,c);")
+    limbo.execute_dot("INSERT INTO other values (23,32,23);")
     limbo.run_test_fn(
         "create virtual table t using kv_store;",
         lambda res: "Virtual table module not found: kv_store" in res,
