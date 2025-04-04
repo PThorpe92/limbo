@@ -86,7 +86,5 @@ pub fn prepare_delete_plan(
 fn estimate_num_instructions(plan: &DeletePlan) -> usize {
     let base = 20;
 
-    let num_instructions = base + plan.table_references.len() * 10;
-
-    num_instructions
+    base + plan.table_references.len() * 10
 }

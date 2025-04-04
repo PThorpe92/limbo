@@ -157,11 +157,11 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
         Some(&result_columns),
         &mut where_clause,
     )?;
-    let limit = if let Some(Ok((limit, _))) = body.limit.as_ref().map(|l| parse_limit(*l.clone())) {
-        limit
-    } else {
-        None
-    };
+    let (limit, offset) = body
+        .limit
+        .as_ref()
+        .map(|l| parse_limit(*l.clone()))
+        .unwrap_or(Ok((None, None)))?;
     Ok(Plan::Update(UpdatePlan {
         table_references,
         set_clauses,
@@ -169,6 +169,7 @@ pub fn prepare_update_plan(schema: &Schema, body: &mut Update) -> crate::Result<
         returning: Some(result_columns),
         order_by,
         limit,
+        offset,
         contains_constant_false_condition: false,
     }))
 }
