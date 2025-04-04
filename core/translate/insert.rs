@@ -297,6 +297,8 @@ struct ColumnMapping<'a> {
     /// If Some(i), use the i-th value from the VALUES tuple
     /// If None, use NULL (column was not specified in INSERT statement)
     value_index: Option<usize>,
+    /// The default value for the column, if defined
+    default_value: Option<&'a Expr>,
 }
 
 /// Resolves how each column in a table should be populated during an INSERT.
@@ -352,6 +354,7 @@ fn resolve_columns_for_insert<'a>(
             .map(|(i, col)| ColumnMapping {
                 column: col,
                 value_index: if i < num_values { Some(i) } else { None },
+                default_value: col.default.as_ref(),
             })
             .collect());
     }
@@ -362,6 +365,7 @@ fn resolve_columns_for_insert<'a>(
         .map(|col| ColumnMapping {
             column: col,
             value_index: None,
+            default_value: col.default.as_ref(),
         })
         .collect();
 
@@ -423,8 +427,10 @@ fn populate_column_registers(
             if write_directly_to_rowid_reg {
                 program.emit_insn(Insn::SoftNull { reg: target_reg });
             }
+        } else if let Some(default_expr) = mapping.default_value {
+            translate_expr(program, None, default_expr, target_reg, resolver)?;
         } else {
-            // Column was not specified - use NULL if it is nullable, otherwise error
+            // Column was not specified as has no DEFAULT - use NULL if it is nullable, otherwise error
             // Rowid alias columns can be NULL because we will autogenerate a rowid in that case.
             let is_nullable = !mapping.column.primary_key || mapping.column.is_rowid_alias;
             if is_nullable {
