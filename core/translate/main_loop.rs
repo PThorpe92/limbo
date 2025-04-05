@@ -613,13 +613,12 @@ fn emit_loop_source(
                 .filter(|rc| {
                     !rc.contains_aggregates && !is_column_in_group_by(&rc.expr, &group_by.exprs)
                 })
-                .map(|rc| &rc.expr)
-                .collect::<Vec<_>>();
-
+                .map(|rc| &rc.expr);
+            let non_agg_count = non_group_by_non_agg_expr.clone().count();
             // Store the count of non-GROUP BY, non-aggregate columns in the metadata
             // This will be used later during aggregation processing
             t_ctx.meta_group_by.as_mut().map(|meta| {
-                meta.non_group_by_non_agg_column_count = Some(non_group_by_non_agg_expr.len());
+                meta.non_group_by_non_agg_column_count = Some(non_agg_count);
                 meta
             });
 
@@ -631,8 +630,7 @@ fn emit_loop_source(
                 .sum::<usize>();
 
             // Calculate total number of registers needed for all columns in the sorter
-            let column_count =
-                group_by.exprs.len() + aggregate_arguments_count + non_group_by_non_agg_expr.len();
+            let column_count = group_by.exprs.len() + aggregate_arguments_count + non_agg_count;
 
             // Allocate a contiguous block of registers for all columns
             let start_reg = program.alloc_registers(column_count);
@@ -655,7 +653,7 @@ fn emit_loop_source(
             // Step 2: Process columns that aren't part of GROUP BY and don't contain aggregates
             // Example: SELECT col1, col2, SUM(col3) FROM table GROUP BY col1
             // Here col2 would be processed in this loop if it's in the result set
-            for expr in non_group_by_non_agg_expr.iter() {
+            for expr in non_group_by_non_agg_expr {
                 let key_reg = cur_reg;
                 cur_reg += 1;
                 translate_expr(

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use limbo_sqlite3_parser::ast;
 
@@ -176,32 +176,29 @@ pub fn emit_group_by<'a>(
     let non_group_by_non_agg_column_count = non_group_by_non_agg_column_count.unwrap();
 
     // We have to know which group by expr present in resulting set
-    let group_by_expr_in_res_cols: Vec<bool> = group_by
-        .exprs
-        .iter()
-        .map(|expr| {
-            plan.result_columns
-                .iter()
-                .any(|e| exprs_are_equivalent(&e.expr, expr))
-        })
-        .collect();
+    let group_by_expr_in_res_cols = group_by.exprs.iter().map(|expr| {
+        plan.result_columns
+            .iter()
+            .any(|e| exprs_are_equivalent(&e.expr, expr))
+    });
 
     // Create a map from sorter column index to result register
     // This helps track where each column from the sorter should be stored
-    let mut column_register_mapping = HashMap::new();
+    let mut column_register_mapping =
+        vec![None; group_by_count + non_group_by_non_agg_column_count];
     let mut next_reg = reg_non_aggregate_exprs_acc;
 
     // Map GROUP BY columns that are in the result set to registers
-    for (i, is_in_result) in group_by_expr_in_res_cols.iter().enumerate() {
-        if *is_in_result {
-            column_register_mapping.insert(i, next_reg);
+    for (i, is_in_result) in group_by_expr_in_res_cols.clone().enumerate() {
+        if is_in_result {
+            column_register_mapping[i] = Some(next_reg);
             next_reg += 1;
         }
     }
 
     // Handle other non-aggregate columns that aren't part of GROUP BY and not part of Aggregation function
     for i in group_by_count..group_by_count + non_group_by_non_agg_column_count {
-        column_register_mapping.insert(i, next_reg);
+        column_register_mapping[i] = Some(next_reg);
         next_reg += 1;
     }
 
@@ -344,12 +341,14 @@ pub fn emit_group_by<'a>(
     });
 
     // Read non-aggregate columns from the current row
-    for (sorter_column_index, dest_reg) in column_register_mapping.iter() {
-        program.emit_insn(Insn::Column {
-            cursor_id: pseudo_cursor,
-            column: *sorter_column_index,
-            dest: *dest_reg,
-        });
+    for (sorter_column_index, dest_reg) in column_register_mapping.iter().enumerate() {
+        if let Some(dest_reg) = dest_reg {
+            program.emit_insn(Insn::Column {
+                cursor_id: pseudo_cursor,
+                column: sorter_column_index,
+                dest: *dest_reg,
+            });
+        }
     }
 
     // Mark that we've stored data for this group
@@ -416,10 +415,15 @@ pub fn emit_group_by<'a>(
     }
 
     // Map GROUP BY expressions to their registers in the result set
-    for (i, expr) in group_by.exprs.iter().enumerate() {
-        if group_by_expr_in_res_cols[i] {
-            if let Some(reg) = &column_register_mapping.get(&i) {
-                t_ctx.resolver.expr_to_reg_cache.push((expr, **reg));
+    for (i, (expr, is_in_result)) in group_by
+        .exprs
+        .iter()
+        .zip(group_by_expr_in_res_cols)
+        .enumerate()
+    {
+        if is_in_result {
+            if let Some(reg) = &column_register_mapping.get(i).and_then(|opt| *opt) {
+                t_ctx.resolver.expr_to_reg_cache.push((expr, *reg));
             }
         }
     }
@@ -432,7 +436,7 @@ pub fn emit_group_by<'a>(
 
     for (idx, rc) in non_agg_cols.enumerate() {
         let sorter_idx = group_by_count + idx;
-        if let Some(&reg) = column_register_mapping.get(&sorter_idx) {
+        if let Some(reg) = column_register_mapping.get(sorter_idx).and_then(|opt| *opt) {
             t_ctx.resolver.expr_to_reg_cache.push((&rc.expr, reg));
         }
     }

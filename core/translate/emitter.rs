@@ -247,12 +247,16 @@ pub fn emit_query<'a>(
             target_pc: after_main_loop_label,
         });
     }
+
+    // For non-grouped aggregation queries that also have non-aggregate columns,
+    // we need to ensure non-aggregate columns are only emitted once.
+    // This flag helps track whether we've already emitted these columns.
     if !plan.aggregates.is_empty()
         && plan.group_by.is_none()
         && plan.result_columns.iter().any(|c| !c.contains_aggregates)
     {
         let flag = program.alloc_register();
-        program.emit_int(0, flag);
+        program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
     }
 
