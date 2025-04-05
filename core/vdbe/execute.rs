@@ -1284,7 +1284,10 @@ pub fn op_column(
                     if cursor.get_null_flag() {
                         RefValue::Null
                     } else {
-                        record.get_value(*column).clone()
+                        match record.get_value_opt(*column) {
+                            Some(val) => val.clone(),
+                            None => RefValue::Null,
+                        }
                     }
                 } else {
                     RefValue::Null
@@ -1311,10 +1314,14 @@ pub fn op_column(
             let record = {
                 let mut cursor = state.get_cursor(*cursor_id);
                 let cursor = cursor.as_sorter_mut();
-                cursor.record().map(|r| r.clone())
+                cursor.record().cloned()
             };
             if let Some(record) = record {
-                state.registers[*dest] = Register::OwnedValue(record.get_value(*column).to_owned());
+                state.registers[*dest] =
+                    Register::OwnedValue(match record.get_value_opt(*column) {
+                        Some(val) => val.to_owned(),
+                        None => OwnedValue::Null,
+                    });
             } else {
                 state.registers[*dest] = Register::OwnedValue(OwnedValue::Null);
             }
