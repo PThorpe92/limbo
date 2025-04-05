@@ -484,10 +484,10 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
-    // cursor_id is a cursor pointing to a B-Tree index that uses integer keys, this op writes the value obtained from MakeRecord into the index.
-    // P3 + P4 are for the original column values that make up that key in unpacked (pre-serialized) form.
-    // If P5 has the OPFLAG_APPEND bit set, that is a hint to the b-tree layer that this insert is likely to be an append.
-    // OPFLAG_NCHANGE bit set, then the change counter is incremented by this instruction. If the OPFLAG_NCHANGE bit is clear, then the change counter is unchanged
+    /// cursor_id is a cursor pointing to a B-Tree index that uses integer keys, this op writes the value obtained from MakeRecord into the index.
+    /// P3 + P4 are for the original column values that make up that key in unpacked (pre-serialized) form.
+    /// If P5 has the OPFLAG_APPEND bit set, that is a hint to the b-tree layer that this insert is likely to be an append.
+    /// OPFLAG_NCHANGE bit set, then the change counter is incremented by this instruction. If the OPFLAG_NCHANGE bit is clear, then the change counter is unchanged
     IdxInsertAsync {
         cursor_id: CursorID,
         record_reg: usize, // P2 the register containing the record to insert
@@ -498,6 +498,9 @@ pub enum Insn {
     IdxInsertAwait {
         cursor_id: CursorID,
     },
+
+    /// The P4 register values beginning with P3 form an unpacked index key that omits the PRIMARY KEY. Compare this key value against the index that P1 is currently pointing to, ignoring the PRIMARY KEY or ROWID fields at the end.
+    /// If the P1 index entry is greater or equal than the key value then jump to P2. Otherwise fall through to the next instruction.
     IdxGE {
         cursor_id: CursorID,
         start_reg: usize,
