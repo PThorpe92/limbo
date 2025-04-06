@@ -471,6 +471,11 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, expr_reg, resolver)?;
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
+        ast::Expr::InSelect { rhs, lhs, not } => {
+            let rhs_reg = program.alloc_register();
+            // let reg = translate_expr(program, Some(referenced_tables), rhs, rhs_reg, resolver);
+            //TODO!!!
+        }
         other => todo!("expression {:?} not implemented", other),
     }
     Ok(())

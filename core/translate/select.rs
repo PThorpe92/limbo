@@ -1,5 +1,5 @@
 use super::emitter::emit_program;
-use super::plan::{select_star, Operation, Search, SelectQueryType};
+use super::plan::{select_star, Operation, Search, SelectQueryType, TableReference, WhereTerm};
 use super::planner::Scope;
 use crate::function::{AggFunc, ExtFunc, Func};
 use crate::translate::optimizer::optimize_plan;
@@ -10,7 +10,7 @@ use crate::translate::planner::{
 };
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
-use crate::SymbolTable;
+use crate::{bail_parse_error, SymbolTable};
 use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use limbo_sqlite3_parser::ast::{self};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
@@ -297,6 +297,13 @@ pub fn prepare_select_plan<'a>(
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
             )?;
+            handle_subquery_predicates(
+                schema,
+                &mut plan.table_references,
+                &mut plan.where_clause,
+                syms,
+                outer_scope,
+            )?;
 
             if let Some(mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
@@ -377,6 +384,46 @@ pub fn prepare_select_plan<'a>(
         }
         _ => todo!(),
     }
+}
+
+fn handle_subquery_predicates<'a>(
+    schema: &Schema,
+    table_ref: &mut Vec<TableReference>,
+    predicates: &[WhereTerm],
+    syms: &SymbolTable,
+    scope: Option<&'a Scope>,
+) -> Result<()> {
+    for clause in predicates {
+        if let ast::Expr::InSelect { rhs, .. } = &clause.expr {
+            let mut plan = prepare_select_plan(schema, *rhs.clone(), syms, scope)?;
+            if let Plan::Select(ref mut select) = plan {
+                println!("Found select plan as predicate subquery");
+                select.query_type = SelectQueryType::Subquery {
+                    yield_reg: 0,
+                    coroutine_implementation_start: crate::vdbe::BranchOffset::Placeholder,
+                };
+                table_ref.extend_from_slice(
+                    &select
+                        .table_references
+                        .iter()
+                        .map(|t| TableReference {
+                            table: t.table.clone(),
+                            identifier: t.identifier.clone(),
+                            join_info: t.join_info.clone(),
+                            op: Operation::Subquery {
+                                plan: Box::new(select.clone()),
+                                result_columns_start_reg: 0,
+                            },
+                        })
+                        .collect::<Vec<_>>()[..],
+                );
+                bind_column_references(&mut clause.expr, table_ref, Some(&select.result_columns));
+            } else {
+                bail_parse_error!("Non select plans not supported in this location");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.

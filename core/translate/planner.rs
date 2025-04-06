@@ -247,7 +247,7 @@ pub fn bind_column_references(
             }
             Ok(())
         }
-        Expr::InSelect { .. } => todo!(),
+        Expr::InSelect { .. } => Ok(()),
         Expr::InTable { .. } => todo!(),
         Expr::IsNull(expr) => {
             bind_column_references(expr, referenced_tables, result_columns)?;
@@ -642,9 +642,7 @@ fn determine_where_to_eval_expr<'a>(predicate: &'a ast::Expr) -> Result<EvalAt> 
             }
         }
         Expr::FunctionCallStar { .. } => {}
-        Expr::InSelect { .. } => {
-            todo!("in select not supported yet")
-        }
+        Expr::InSelect { .. } => eval_at = eval_at.max(EvalAt::Loop(0)), //FIXME
         Expr::InTable { .. } => {
             todo!("in table not supported yet")
         }
