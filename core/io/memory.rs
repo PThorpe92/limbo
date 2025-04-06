@@ -1,6 +1,7 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
 use crate::Result;
 
+use crate::io::clock::Instant;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
     collections::BTreeMap,
@@ -26,6 +27,16 @@ impl MemoryIO {
 impl Default for MemoryIO {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clock for MemoryIO {
+    fn now(&self) -> Instant {
+        let now = chrono::Local::now();
+        Instant {
+            secs: now.timestamp(),
+            micros: now.timestamp_subsec_micros(),
+        }
     }
 }
 
