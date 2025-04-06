@@ -84,11 +84,11 @@ pub fn translate_insert(
     );
     let root_page = btree_table.root_page;
     let values = match body {
-        InsertBody::Select(select, None) => match &select.body.select.deref() {
+        InsertBody::Select(select, _) => match &select.body.select.deref() {
             OneSelect::Values(values) => values,
             _ => todo!(),
         },
-        _ => todo!(),
+        InsertBody::DefaultValues => &vec![vec![]],
     };
 
     let column_mappings = resolve_columns_for_insert(&table, columns, values)?;
