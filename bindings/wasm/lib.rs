@@ -309,11 +309,6 @@ impl limbo_core::IO for PlatformIO {
     fn get_memory_io(&self) -> Arc<limbo_core::MemoryIO> {
         Arc::new(limbo_core::MemoryIO::new())
     }
-
-    fn get_current_time(&self) -> String {
-        let date = Date::new();
-        date.toISOString()
-    }
 }
 
 #[wasm_bindgen]

@@ -161,6 +161,7 @@ pub struct BTreeTable {
     pub primary_key_column_names: Vec<String>,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
+    pub is_ephemeral: bool,
 }
 
 impl BTreeTable {
@@ -390,6 +391,7 @@ fn create_table(
         has_rowid,
         primary_key_column_names,
         columns: cols,
+        is_ephemeral: false,
     })
 }
 
@@ -600,6 +602,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
                 default: None,
             },
         ],
+        is_ephemeral: false,
     }
 }
 

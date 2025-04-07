@@ -276,6 +276,7 @@ pub enum Operation {
     Subquery {
         plan: Box<SelectPlan>,
         result_columns_start_reg: usize,
+        is_predicate: bool,
     },
 }
 
@@ -314,6 +315,7 @@ impl TableReference {
             op: Operation::Subquery {
                 plan: Box::new(plan),
                 result_columns_start_reg: 0, // Will be set in the bytecode emission phase
+                is_predicate: false,
             },
             table,
             identifier: identifier.clone(),

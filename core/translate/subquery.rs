@@ -20,14 +20,17 @@ pub fn emit_subqueries(
         if let Operation::Subquery {
             plan,
             result_columns_start_reg,
+            is_predicate,
         } = &mut table.op
         {
-            // Emit the subquery and get the start register of the result columns.
-            let result_columns_start = emit_subquery(program, plan, t_ctx)?;
-            // Set the start register of the subquery's result columns.
-            // This is done so that translate_expr() can read the result columns of the subquery,
-            // as if it were reading from a regular table.
-            *result_columns_start_reg = result_columns_start;
+            if !*is_predicate {
+                // Emit the subquery and get the start register of the result columns.
+                let result_columns_start = emit_subquery(program, plan, t_ctx)?;
+                // Set the start register of the subquery's result columns.
+                // This is done so that translate_expr() can read the result columns of the subquery,
+                // as if it were reading from a regular table.
+                *result_columns_start_reg = result_columns_start;
+            }
         }
     }
     Ok(())

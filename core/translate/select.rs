@@ -2,6 +2,7 @@ use super::emitter::emit_program;
 use super::plan::{select_star, Operation, Search, SelectQueryType, TableReference, WhereTerm};
 use super::planner::Scope;
 use crate::function::{AggFunc, ExtFunc, Func};
+use crate::schema::{BTreeTable, Table};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{Aggregate, Direction, GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
@@ -389,15 +390,14 @@ pub fn prepare_select_plan<'a>(
 fn handle_subquery_predicates<'a>(
     schema: &Schema,
     table_ref: &mut Vec<TableReference>,
-    predicates: &[WhereTerm],
+    predicates: &mut [WhereTerm],
     syms: &SymbolTable,
     scope: Option<&'a Scope>,
 ) -> Result<()> {
     for clause in predicates {
-        if let ast::Expr::InSelect { rhs, .. } = &clause.expr {
+        if let ast::Expr::InSelect { rhs, lhs, not } = &mut clause.expr {
             let mut plan = prepare_select_plan(schema, *rhs.clone(), syms, scope)?;
             if let Plan::Select(ref mut select) = plan {
-                println!("Found select plan as predicate subquery");
                 select.query_type = SelectQueryType::Subquery {
                     yield_reg: 0,
                     coroutine_implementation_start: crate::vdbe::BranchOffset::Placeholder,
@@ -406,18 +406,42 @@ fn handle_subquery_predicates<'a>(
                     &select
                         .table_references
                         .iter()
-                        .map(|t| TableReference {
-                            table: t.table.clone(),
-                            identifier: t.identifier.clone(),
-                            join_info: t.join_info.clone(),
-                            op: Operation::Subquery {
-                                plan: Box::new(select.clone()),
-                                result_columns_start_reg: 0,
-                            },
+                        .filter_map(|t| {
+                            t.table.btree().map(|btree| {
+                                TableReference {
+                                    // TODO!!!!!!!!!!!!!!!!!!!!!!!
+                                    table: Table::BTree(
+                                        BTreeTable {
+                                            root_page: btree.root_page,
+                                            name: btree.name.clone(),
+                                            is_ephemeral: true,
+                                            has_rowid: btree.has_rowid,
+                                            primary_key_column_names: btree
+                                                .primary_key_column_names
+                                                .clone(),
+                                            columns: btree.columns.clone(),
+                                        }
+                                        .into(),
+                                    ),
+                                    identifier: t.identifier.clone(),
+                                    join_info: t.join_info.clone(),
+                                    op: Operation::Subquery {
+                                        plan: Box::new(select.clone()),
+                                        result_columns_start_reg: 0,
+                                        is_predicate: true,
+                                    },
+                                }
+                            })
                         })
                         .collect::<Vec<_>>()[..],
                 );
-                bind_column_references(&mut clause.expr, table_ref, Some(&select.result_columns));
+                bind_column_references(lhs, table_ref, Some(&select.result_columns))?;
+                // Vec<Column>
+                let new_rhs = select
+                    .result_columns
+                    .iter()
+                    .map(|rc| rc.expr.clone())
+                    .collect();
             } else {
                 bail_parse_error!("Non select plans not supported in this location");
             }

@@ -472,9 +472,9 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, expr_reg);
         }
         ast::Expr::InSelect { rhs, lhs, not } => {
-            let rhs_reg = program.alloc_register();
-            // let reg = translate_expr(program, Some(referenced_tables), rhs, rhs_reg, resolver);
-            //TODO!!!
+            // select * from products where Expr::Column{id} IN (select id from products limit 10);
+            let lhs_reg = program.alloc_register();
+            let reg = translate_expr(program, Some(referenced_tables), lhs, lhs_reg, resolver);
         }
         other => todo!("expression {:?} not implemented", other),
     }

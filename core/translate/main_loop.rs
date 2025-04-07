@@ -59,14 +59,14 @@ impl LoopLabels {
 pub fn init_loop(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    tables: &[TableReference],
+    tables: &mut [TableReference],
     mode: OperationMode,
 ) -> Result<()> {
     assert!(
         t_ctx.meta_left_joins.len() == tables.len(),
         "meta_left_joins length does not match tables length"
     );
-    for (table_index, table) in tables.iter().enumerate() {
+    for (table_index, table) in tables.iter_mut().enumerate() {
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
@@ -78,7 +78,7 @@ pub fn init_loop(
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
             }
         }
-        match &table.op {
+        match &mut table.op {
             Operation::Scan { .. } => {
                 let cursor_id = program.alloc_cursor_id(
                     Some(table.identifier.clone()),
@@ -128,10 +128,10 @@ pub fn init_loop(
                     }
                 }
             }
-            Operation::Search(search) => {
+            Operation::Search(ref search) => {
                 let table_cursor_id = program.alloc_cursor_id(
                     Some(table.identifier.clone()),
-                    CursorType::BTreeTable(table.btree().unwrap().clone()),
+                    CursorType::BTreeTable(table.table.btree().unwrap().clone()),
                 );
 
                 match mode {
@@ -191,6 +191,32 @@ pub fn init_loop(
                         }
                         _ => {
                             unimplemented!()
+                        }
+                    }
+                }
+            }
+            Operation::Subquery {
+                ref mut result_columns_start_reg,
+                is_predicate,
+                ..
+            } => {
+                if *is_predicate {
+                    if let Some(btree) = table.table.btree() {
+                        let cursor_id = program.alloc_cursor_id(
+                            Some(table.identifier.clone()),
+                            match &table.table {
+                                Table::BTree(_) => {
+                                    CursorType::BTreeTable(table.table.btree().unwrap().clone())
+                                }
+                                _ => todo!(),
+                            },
+                        );
+                        *result_columns_start_reg = t_ctx.reg_result_cols_start.unwrap_or(0);
+                        if btree.is_ephemeral {
+                            program.emit_insn(Insn::OpenEphemeral {
+                                cursor_id,
+                                is_btree: true,
+                            });
                         }
                     }
                 }

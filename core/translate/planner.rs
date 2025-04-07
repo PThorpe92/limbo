@@ -106,7 +106,7 @@ pub fn bind_column_references(
                     return Ok(());
                 }
             }
-            let mut match_result = None;
+            let mut match_result: Option<(usize, usize, bool, &str)> = None;
             for (tbl_idx, table) in referenced_tables.iter().enumerate() {
                 let col_idx = table.columns().iter().position(|c| {
                     c.name
@@ -114,14 +114,21 @@ pub fn bind_column_references(
                         .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
                 });
                 if col_idx.is_some() {
-                    if match_result.is_some() {
-                        crate::bail_parse_error!("Column {} is ambiguous", id.0);
+                    if let Some((_, _, _, ident)) = match_result {
+                        if !ident.eq_ignore_ascii_case(&table.identifier) {
+                            crate::bail_parse_error!("Column {} is ambiguous", id.0);
+                        }
                     }
                     let col = table.columns().get(col_idx.unwrap()).unwrap();
-                    match_result = Some((tbl_idx, col_idx.unwrap(), col.is_rowid_alias));
+                    match_result = Some((
+                        tbl_idx,
+                        col_idx.unwrap(),
+                        col.is_rowid_alias,
+                        &table.identifier,
+                    ));
                 }
             }
-            if let Some((tbl_idx, col_idx, is_rowid_alias)) = match_result {
+            if let Some((tbl_idx, col_idx, is_rowid_alias, _)) = match_result {
                 *expr = Expr::Column {
                     database: None, // TODO: support different databases
                     table: tbl_idx,

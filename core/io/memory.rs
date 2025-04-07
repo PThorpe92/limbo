@@ -59,10 +59,6 @@ impl IO for MemoryIO {
         i64::from_ne_bytes(buf)
     }
 
-    fn get_current_time(&self) -> String {
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-    }
-
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
     }

@@ -274,7 +274,7 @@ pub fn emit_query<'a>(
     init_loop(
         program,
         t_ctx,
-        &plan.table_references,
+        &mut plan.table_references,
         OperationMode::SELECT,
     )?;
 
@@ -328,7 +328,7 @@ pub fn emit_query<'a>(
 
 fn emit_program_for_delete(
     program: &mut ProgramBuilder,
-    plan: DeletePlan,
+    mut plan: DeletePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
     let (mut t_ctx, init_label, start_offset) = prologue(
@@ -359,7 +359,7 @@ fn emit_program_for_delete(
     init_loop(
         program,
         &mut t_ctx,
-        &plan.table_references,
+        &mut plan.table_references,
         OperationMode::DELETE,
     )?;
 
@@ -447,7 +447,7 @@ fn emit_delete_insns(
 
 fn emit_program_for_update(
     program: &mut ProgramBuilder,
-    plan: UpdatePlan,
+    mut plan: UpdatePlan,
     syms: &SymbolTable,
 ) -> Result<()> {
     let (mut t_ctx, init_label, start_offset) = prologue(
@@ -499,7 +499,7 @@ fn emit_program_for_update(
     init_loop(
         program,
         &mut t_ctx,
-        &plan.table_references,
+        &mut plan.table_references,
         OperationMode::UPDATE,
     )?;
     open_loop(

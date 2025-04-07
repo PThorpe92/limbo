@@ -42,8 +42,6 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
-
-    fn get_current_time(&self) -> String;
 }
 
 pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
