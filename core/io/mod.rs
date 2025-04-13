@@ -1,20 +1,15 @@
-use crate::Result;
-use cfg_block::cfg_block;
-use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
-use std::{
-    cell::{Ref, RefCell, RefMut},
-    fmt::Debug,
-    mem::ManuallyDrop,
-    pin::Pin,
-    rc::Rc,
-};
+
+use crate::storage::buffer_pool::BufferRef;
+use crate::{BufferPool, Result};
+use cfg_block::cfg_block;
 
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: usize, c: Completion) -> Result<()>;
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<Buffer>>, c: Completion) -> Result<()>;
+    fn pwrite(&self, pos: usize, buffer: BufferRef, c: Completion) -> Result<()>;
     fn sync(&self, c: Completion) -> Result<()>;
     fn size(&self) -> Result<u64>;
 }
@@ -34,6 +29,66 @@ impl OpenFlags {
     }
 }
 
+pub struct IOManager {
+    io: Arc<dyn IO>,
+    buffer_pool: Arc<BufferPool>,
+}
+
+impl Deref for IOManager {
+    type Target = dyn IO;
+
+    fn deref(&self) -> &Self::Target {
+        self.io.as_ref()
+    }
+}
+
+impl IOManager {
+    pub fn new(io: Arc<dyn IO>, page_size: usize, default_pages: usize) -> Arc<Self> {
+        Arc::new(IOManager {
+            io: io.clone(),
+            buffer_pool: BufferPool::new(default_pages, page_size, io),
+        })
+    }
+
+    pub fn run_once(&self) -> Result<()> {
+        self.io.run_once()
+    }
+
+    pub fn expand_by(&self, pages: usize) {
+        self.buffer_pool.expand(self.io.clone(), pages);
+    }
+
+    pub fn allocate_page(&self) -> BufferRef {
+        self.buffer_pool.get(&self.io, None)
+    }
+
+    pub fn buf_with_size(&self, size: usize) -> BufferRef {
+        self.buffer_pool.get(&self.io, Some(size))
+    }
+
+    pub fn prepare_read_page<F>(&self, size: Option<usize>, complete_fn: F) -> Completion
+    where
+        F: Fn(BufferRef) + Send + Sync + 'static,
+    {
+        let buffer = self.buffer_pool.get(&self.io, size);
+        Completion::Read(ReadCompletion(buffer, Box::new(complete_fn)))
+    }
+
+    pub fn prepare_write_page<F>(&self, complete_fn: F) -> Completion
+    where
+        F: Fn(i32) + Send + Sync + 'static,
+    {
+        Completion::Write(WriteCompletion(Box::new(complete_fn)))
+    }
+
+    pub fn prepare_sync<F>(&self, complete_fn: F) -> Completion
+    where
+        F: Fn(i32) + Send + Sync + 'static,
+    {
+        Completion::Sync(SyncCompletion(Box::new(complete_fn)))
+    }
+}
+
 pub trait IO: Clock + Send + Sync {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>>;
 
@@ -42,11 +97,15 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
+
+    fn register_buffers(&self, buffers: &[(u16, *const u8, usize)]) -> Result<()> {
+        Ok(())
+    }
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
-pub type WriteComplete = dyn Fn(i32);
-pub type SyncComplete = dyn Fn(i32);
+pub type Complete = Box<dyn Fn(BufferRef) + Send + Sync>;
+pub type WriteComplete = Box<dyn FnMut(i32) + Send + Sync>;
+pub type SyncComplete = Box<dyn Fn(i32) + Send + Sync>;
 
 pub enum Completion {
     Read(ReadCompletion),
@@ -54,132 +113,61 @@ pub enum Completion {
     Sync(SyncCompletion),
 }
 
-pub struct ReadCompletion {
-    pub buf: Arc<RefCell<Buffer>>,
-    pub complete: Box<Complete>,
-}
-
 impl Completion {
-    pub fn complete(&self, result: i32) {
+    pub fn complete(self, result: i32) {
         match self {
-            Self::Read(r) => r.complete(),
-            Self::Write(w) => w.complete(result),
-            Self::Sync(s) => s.complete(result), // fix
+            Completion::Read(r) => r.complete(result),
+            Completion::Write(w) => w.complete(result),
+            Completion::Sync(s) => s.complete(result),
         }
     }
-
-    /// only call this method if you are sure that the completion is
-    /// a ReadCompletion, panics otherwise
     pub fn as_read(&self) -> &ReadCompletion {
         match self {
-            Self::Read(ref r) => r,
-            _ => unreachable!(),
+            Completion::Read(r) => r,
+            _ => panic!("Not a read completion"),
         }
     }
 }
 
-pub struct WriteCompletion {
-    pub complete: Box<WriteComplete>,
-}
-
-pub struct SyncCompletion {
-    pub complete: Box<SyncComplete>,
-}
+// read completion needs the ID of the buffer and the callback
+pub struct ReadCompletion(BufferRef, Complete);
 
 impl ReadCompletion {
-    pub fn new(buf: Arc<RefCell<Buffer>>, complete: Box<Complete>) -> Self {
-        Self { buf, complete }
+    pub fn new(buf: BufferRef, complete: Complete) -> Self {
+        Self(buf, complete)
     }
-
-    pub fn buf(&self) -> Ref<'_, Buffer> {
-        self.buf.borrow()
+    pub fn complete(self, _res: i32) {
+        self.1(self.0)
     }
-
-    pub fn buf_mut(&self) -> RefMut<'_, Buffer> {
-        self.buf.borrow_mut()
+    pub fn buf_ptr(&self) -> *mut u8 {
+        self.0.as_mut_ptr()
     }
-
-    pub fn complete(&self) {
-        (self.complete)(self.buf.clone());
+    pub fn buf_slice(&self) -> &mut [u8] {
+        self.0.as_mut_slice()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
+pub struct WriteCompletion(WriteComplete);
+
+pub struct SyncCompletion(SyncComplete);
 
 impl WriteCompletion {
-    pub fn new(complete: Box<WriteComplete>) -> Self {
-        Self { complete }
+    pub fn new(complete: WriteComplete) -> Self {
+        Self(complete)
     }
-
-    pub fn complete(&self, bytes_written: i32) {
-        (self.complete)(bytes_written);
+    pub fn complete(mut self, result: i32) {
+        (self.0)(result)
     }
 }
 
 impl SyncCompletion {
-    pub fn new(complete: Box<SyncComplete>) -> Self {
-        Self { complete }
+    pub fn new(complete: SyncComplete) -> Self {
+        Self(complete)
     }
-
-    pub fn complete(&self, res: i32) {
-        (self.complete)(res);
-    }
-}
-
-pub type BufferData = Pin<Vec<u8>>;
-
-pub type BufferDropFn = Rc<dyn Fn(BufferData)>;
-
-#[derive(Clone)]
-pub struct Buffer {
-    data: ManuallyDrop<BufferData>,
-    drop: BufferDropFn,
-}
-
-impl Debug for Buffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.data)
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let data = unsafe { ManuallyDrop::take(&mut self.data) };
-        (self.drop)(data);
-    }
-}
-
-impl Buffer {
-    pub fn allocate(size: usize, drop: BufferDropFn) -> Self {
-        let data = ManuallyDrop::new(Pin::new(vec![0; size]));
-        Self { data, drop }
-    }
-
-    pub fn new(data: BufferData, drop: BufferDropFn) -> Self {
-        let data = ManuallyDrop::new(data);
-        Self { data, drop }
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    pub fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr()
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
+    pub fn complete(mut self, result: i32) {
+        (self.0)(result)
     }
 }
 

@@ -4234,7 +4234,7 @@ fn free_cell_range(
 fn defragment_page(page: &PageContent, usable_space: u16) {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page");
-    let cloned_page = page.clone();
+    let cloned_page = page.cloned();
     // TODO(pere): usable space should include offset probably
     let mut cbrk = usable_space;
 
@@ -4691,10 +4691,11 @@ mod tests {
     use super::*;
     use crate::{
         fast_lock::SpinLock,
-        io::{Buffer, Completion, MemoryIO, OpenFlags, IO},
+        io::{Buffer, Completion, IOManager, MemoryIO, OpenFlags, IO},
         storage::{
-            database::DatabaseFile, page_cache::DumbLruPageCache, sqlite3_ondisk,
-            sqlite3_ondisk::DatabaseHeader,
+            database::DatabaseFile,
+            page_cache::DumbLruPageCache,
+            sqlite3_ondisk::{self, DatabaseHeader},
         },
         types::Text,
         vdbe::Register,
@@ -5003,16 +5004,16 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
-
-        let buffer_pool = Rc::new(BufferPool::new(db_header.page_size as usize));
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", db_header.page_size).unwrap();
-        let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
+        let io_mgr = IOManager::new(io.clone(), 3, 16);
+        let wal_shared =
+            WalFileShared::open_shared(io_mgr.clone(), "test.wal", db_header.page_size).unwrap();
+        let wal_file = WalFile::new(io_mgr.clone(), page_size, wal_shared);
         let wal = Rc::new(RefCell::new(wal_file));
 
         let page_cache = Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10)));
         let pager = {
             let db_header = Arc::new(SpinLock::new(db_header.clone()));
-            Pager::finish_open(db_header, db_file, Some(wal), io, page_cache, buffer_pool).unwrap()
+            Pager::finish_open(db_header, db_file, Some(wal), io_mgr.clone(), page_cache).unwrap()
         };
         let pager = Rc::new(pager);
         let page1 = pager.allocate_page().unwrap();
@@ -5291,25 +5292,15 @@ mod tests {
         db_header.page_size = page_size;
         db_header.database_size = database_size;
         let db_header = Arc::new(SpinLock::new(db_header));
-
-        let buffer_pool = Rc::new(BufferPool::new(10));
-
-        // Initialize buffer pool with correctly sized buffers
-        for _ in 0..10 {
-            let vec = vec![0; page_size as usize]; // Initialize with correct length, not just capacity
-            buffer_pool.put(Pin::new(vec));
-        }
+        let io_mgr = IOManager::new(Arc::new(MemoryIO::new()), page_size as usize, 10);
 
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db_file = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
-
-        let drop_fn = Rc::new(|_buf| {});
-        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
+        let buf = io_mgr.buf_with_size(page_size as usize);
         {
-            let mut buf_mut = buf.borrow_mut();
-            let buf_slice = buf_mut.as_mut_slice();
+            let buf_slice = buf.as_mut_slice();
             sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
         }
 
@@ -5317,12 +5308,11 @@ mod tests {
         let c = Completion::Write(WriteCompletion::new(write_complete));
         db_file.write_page(1, buf.clone(), c).unwrap();
 
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
+        let wal_shared = WalFileShared::open_shared(io_mgr.clone(), "test.wal", page_size).unwrap();
         let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
+            io_mgr.clone(),
             page_size as usize,
             wal_shared,
-            buffer_pool.clone(),
         )));
 
         let pager = Rc::new(
@@ -5330,9 +5320,9 @@ mod tests {
                 db_header.clone(),
                 db_file,
                 Some(wal),
-                io,
+                wal,
+                io_mgr.clone(),
                 Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10))),
-                buffer_pool,
             )
             .unwrap(),
         );

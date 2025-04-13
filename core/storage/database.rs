@@ -1,6 +1,8 @@
 use crate::error::LimboError;
-use crate::{io::Completion, Buffer, Result};
-use std::{cell::RefCell, sync::Arc};
+use crate::{io::Completion, Result};
+use std::sync::Arc;
+
+use super::buffer_pool::BufferRef;
 
 /// DatabaseStorage is an interface a database file that consists of pages.
 ///
@@ -9,12 +11,7 @@ use std::{cell::RefCell, sync::Arc};
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()>;
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()>;
+    fn write_page(&self, page_idx: usize, buffer: BufferRef, c: Completion) -> Result<()>;
     fn sync(&self, c: Completion) -> Result<()>;
 }
 
@@ -32,7 +29,7 @@ unsafe impl Sync for DatabaseFile {}
 impl DatabaseStorage for DatabaseFile {
     fn read_page(&self, page_idx: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
-        let size = r.buf().len();
+        let size = r.len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
@@ -42,13 +39,8 @@ impl DatabaseStorage for DatabaseFile {
         Ok(())
     }
 
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()> {
-        let buffer_size = buffer.borrow().len();
+    fn write_page(&self, page_idx: usize, buffer: BufferRef, c: Completion) -> Result<()> {
+        let buffer_size = buffer.len();
         assert!(page_idx > 0);
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
@@ -83,7 +75,7 @@ impl DatabaseStorage for FileMemoryStorage {
             Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        let size = r.buf().len();
+        let size = r.len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
@@ -93,13 +85,8 @@ impl DatabaseStorage for FileMemoryStorage {
         Ok(())
     }
 
-    fn write_page(
-        &self,
-        page_idx: usize,
-        buffer: Arc<RefCell<Buffer>>,
-        c: Completion,
-    ) -> Result<()> {
-        let buffer_size = buffer.borrow().len();
+    fn write_page(&self, page_idx: usize, buffer: BufferRef, c: Completion) -> Result<()> {
+        let buffer_size = buffer.len();
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);

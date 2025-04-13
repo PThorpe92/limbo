@@ -40,8 +40,8 @@ use crate::{
 };
 
 use crate::{
-    info, maybe_init_database_file, BufferPool, MvCursor, OpenFlags, RefValue, Row, StepResult,
-    TransactionState, IO,
+    info, maybe_init_database_file, BufferPool, IOManager, MvCursor, OpenFlags, RefValue, Row,
+    StepResult, TransactionState, DEFAULT_PAGE_SIZE, IO,
 };
 
 use super::{
@@ -4528,22 +4528,20 @@ pub fn op_open_ephemeral(
 
     let conn = program.connection.upgrade().unwrap();
     let io = conn.pager.io.get_memory_io();
-
+    let ephemeral_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 2);
     let file = io.open_file("", OpenFlags::Create, true)?;
-    maybe_init_database_file(&file, &(io.clone() as Arc<dyn IO>))?;
+    maybe_init_database_file(&file, &ephemeral_mgr)?;
     let db_file = Arc::new(FileMemoryStorage::new(file));
 
-    let db_header = Pager::begin_open(db_file.clone())?;
-    let buffer_pool = Rc::new(BufferPool::new(db_header.lock().page_size as usize));
+    let db_header = Pager::begin_open(ephemeral_mgr.clone(), db_file.clone())?;
     let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(10)));
 
     let pager = Rc::new(Pager::finish_open(
         db_header,
         db_file,
         None,
-        io,
+        ephemeral_mgr,
         page_cache,
-        buffer_pool,
     )?);
 
     let flag = if *is_table {

@@ -1,6 +1,7 @@
 use js_sys::{Array, Object};
 use limbo_core::{
-    maybe_init_database_file, Clock, Instant, OpenFlags, Pager, Result, WalFileShared,
+    maybe_init_database_file, Clock, IOManager, Instant, OpenFlags, Pager, Result, WalFileShared,
+    DEFAULT_PAGE_SIZE,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -22,15 +23,20 @@ impl Database {
         let file = io
             .open_file(path, limbo_core::OpenFlags::Create, false)
             .unwrap();
-        maybe_init_database_file(&file, &io).unwrap();
+        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE, 16);
+        maybe_init_database_file(&file, &io_mgr).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db_header = Pager::begin_open(db_file.clone()).unwrap();
+        let db_header = Pager::begin_open(io_mgr.clone(), db_file.clone()).unwrap();
 
         // ensure db header is there
         io.run_once().unwrap();
 
         let page_size = db_header.lock().page_size;
-
+        let io_mgr = if page_size != DEFAULT_PAGE_SIZE {
+            IOManager::new(io.clone(), page_size, 16)
+        } else {
+            io_mgr
+        };
         let wal_path = format!("{}-wal", path);
         let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
 

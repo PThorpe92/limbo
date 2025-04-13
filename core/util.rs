@@ -4,7 +4,7 @@ use std::{rc::Rc, sync::Arc};
 use crate::{
     schema::{self, Column, Schema, Type},
     types::{OwnedValue, OwnedValueType},
-    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
+    IOManager, LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 
 pub trait RoundToPrecision {
@@ -39,7 +39,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 pub fn parse_schema_rows(
     rows: Option<Statement>,
     schema: &mut Schema,
-    io: Arc<dyn IO>,
+    io: Arc<IOManager>,
     syms: &SymbolTable,
     mv_tx_id: Option<u64>,
 ) -> Result<()> {

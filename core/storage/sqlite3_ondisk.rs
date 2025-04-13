@@ -43,8 +43,7 @@
 
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, ReadCompletion, SyncCompletion, WriteCompletion};
-use crate::storage::buffer_pool::BufferPool;
+use crate::io::{Completion, IOManager, ReadCompletion, WriteCompletion};
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{ImmutableRecord, RawSlice, RefValue, TextRef, TextSubtype};
@@ -53,9 +52,11 @@ use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::trace;
 
+use super::buffer_pool::BufferRef;
 use super::pager::PageRef;
 
 /// The size of the database header in bytes.
@@ -244,27 +245,23 @@ impl Default for DatabaseHeader {
 }
 
 pub fn begin_read_database_header(
+    io: &Arc<IOManager>,
     db_file: Arc<dyn DatabaseStorage>,
 ) -> Result<Arc<SpinLock<DatabaseHeader>>> {
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = io.prepare_read_page(Some(512), move |buf: BufferRef| {
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();
     });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    db_file.read_page(1, c)?;
+    db_file.read_page(1, complete)?;
     Ok(result)
 }
 
 fn finish_read_database_header(
-    buf: Arc<RefCell<Buffer>>,
+    buf: BufferRef,
     header: Arc<SpinLock<DatabaseHeader>>,
 ) -> Result<()> {
-    let buf = buf.borrow();
     let buf = buf.as_slice();
     let mut header = header.lock();
     header.magic.copy_from_slice(&buf[0..16]);
@@ -298,41 +295,34 @@ fn finish_read_database_header(
 
 pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Result<()> {
     let page_source = pager.db_file.clone();
-    let header = Rc::new(header.clone());
+    let header = Arc::new(header.clone());
 
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buffer_to_copy = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+    let buffer_to_copy = pager.io.buf_with_size(512);
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
-    let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>| {
-        let buffer = buffer.borrow().clone();
-        let buffer = Rc::new(RefCell::new(buffer));
-        let mut buf_mut = buffer.borrow_mut();
-        write_header_to_buf(buf_mut.as_mut_slice(), &header);
-        let mut dest_buf = buffer_to_copy_in_cb.borrow_mut();
-        dest_buf.as_mut_slice().copy_from_slice(buf_mut.as_slice());
-    });
-
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
-    let c = Completion::Read(ReadCompletion::new(buf, read_complete));
+    let c = pager
+        .io
+        .prepare_read_page(Some(512), move |buffer: BufferRef| {
+            let buffer = buffer.clone();
+            let buffer = Rc::new(RefCell::new(buffer));
+            let buf_mut = buffer.borrow_mut();
+            write_header_to_buf(buf_mut.as_mut_slice(), &header);
+            let dest_buf = buffer_to_copy_in_cb.as_mut_slice();
+            dest_buf.copy_from_slice(buf_mut.as_slice());
+        });
     page_source.read_page(1, c)?;
     // run get header block
     pager.io.run_once()?;
 
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
-    let write_complete = Box::new(move |bytes_written: i32| {
-        let buf_len = buffer_to_copy_in_cb.borrow().len();
+    let write_complete = pager.io.prepare_write_page(move |bytes_written: i32| {
+        let buf_len = buffer_to_copy_in_cb.len();
         if bytes_written < buf_len as i32 {
             tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
         }
         // finish_read_database_header(buf, header).unwrap();
     });
-
-    let c = Completion::Write(WriteCompletion::new(write_complete));
-    page_source.write_page(1, buffer_to_copy, c)?;
+    page_source.write_page(1, buffer_to_copy, write_complete)?;
 
     Ok(())
 }
@@ -397,27 +387,24 @@ pub struct OverflowCell {
 #[derive(Debug)]
 pub struct PageContent {
     pub offset: usize,
-    pub buffer: Arc<RefCell<Buffer>>,
+    pub buffer: BufferRef,
     pub overflow_cells: Vec<OverflowCell>,
 }
 
-impl Clone for PageContent {
-    fn clone(&self) -> Self {
-        #[allow(clippy::arc_with_non_send_sync)]
-        Self {
-            offset: self.offset,
-            buffer: Arc::new(RefCell::new((*self.buffer.borrow()).clone())),
-            overflow_cells: self.overflow_cells.clone(),
-        }
-    }
-}
-
 impl PageContent {
-    pub fn new(offset: usize, buffer: Arc<RefCell<Buffer>>) -> Self {
+    pub fn new(offset: usize, buffer: BufferRef) -> Self {
         Self {
             offset,
             buffer,
             overflow_cells: Vec::new(),
+        }
+    }
+
+    pub fn cloned(&self) -> Self {
+        Self {
+            offset: self.offset,
+            buffer: self.buffer.new_cloned().into(),
+            overflow_cells: self.overflow_cells.clone(),
         }
     }
 
@@ -434,12 +421,7 @@ impl PageContent {
 
     #[allow(clippy::mut_from_ref)]
     pub fn as_ptr(&self) -> &mut [u8] {
-        unsafe {
-            // unsafe trick to borrow twice
-            let buf_pointer = &self.buffer.as_ptr();
-            let buf = (*buf_pointer).as_mut().unwrap().as_mut_slice();
-            buf
-        }
+        self.buffer.as_mut_slice()
     }
 
     pub fn read_u8(&self, pos: usize) -> u8 {
@@ -714,35 +696,23 @@ impl PageContent {
 }
 
 pub fn begin_read_page(
+    io: Arc<IOManager>,
     db_file: Arc<dyn DatabaseStorage>,
-    buffer_pool: Rc<BufferPool>,
     page: PageRef,
     page_idx: usize,
 ) -> Result<()> {
     trace!("begin_read_btree_page(page_idx = {})", page_idx);
-    let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
-        let buffer_pool = buffer_pool.clone();
-        buffer_pool.put(buf);
-    });
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = io.prepare_read_page(None, move |buf: BufferRef| {
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
         }
     });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    db_file.read_page(page_idx, c)?;
+    db_file.read_page(page_idx, complete)?;
     Ok(())
 }
 
-fn finish_read_page(
-    page_idx: usize,
-    buffer_ref: Arc<RefCell<Buffer>>,
-    page: PageRef,
-) -> Result<()> {
+fn finish_read_page(page_idx: usize, buffer_ref: BufferRef, page: PageRef) -> Result<()> {
     trace!("finish_read_btree_page(page_idx = {})", page_idx);
     let pos = if page_idx == 1 {
         DATABASE_HEADER_SIZE
@@ -762,7 +732,7 @@ fn finish_read_page(
 pub fn begin_write_btree_page(
     pager: &Pager,
     page: &PageRef,
-    write_counter: Rc<RefCell<usize>>,
+    write_counter: Arc<AtomicUsize>,
 ) -> Result<()> {
     trace!("begin_write_btree_page(page={})", page.get().id);
     let page_source = &pager.db_file;
@@ -776,14 +746,15 @@ pub fn begin_write_btree_page(
         contents.buffer.clone()
     };
 
-    *write_counter.borrow_mut() += 1;
+    write_counter.fetch_add(1, Ordering::Relaxed);
+    let wc = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
-        Box::new(move |bytes_written: i32| {
+        pager.io.prepare_write_page(move |bytes_written: i32| {
             trace!("finish_write_btree_page");
             let buf_copy = buf_copy.clone();
-            let buf_len = buf_copy.borrow().len();
-            *write_counter.borrow_mut() -= 1;
+            let buf_len = buf_copy.len();
+            wc.fetch_sub(1, Ordering::Relaxed);
 
             page_finish.clear_dirty();
             if bytes_written < buf_len as i32 {
@@ -791,18 +762,19 @@ pub fn begin_write_btree_page(
             }
         })
     };
-    let c = Completion::Write(WriteCompletion::new(write_complete));
-    page_source.write_page(page_id, buffer.clone(), c)?;
+    page_source.write_page(page_id, buffer.clone(), write_complete)?;
     Ok(())
 }
 
-pub fn begin_sync(db_file: Arc<dyn DatabaseStorage>, syncing: Rc<RefCell<bool>>) -> Result<()> {
-    assert!(!*syncing.borrow());
-    *syncing.borrow_mut() = true;
-    let completion = Completion::Sync(SyncCompletion {
-        complete: Box::new(move |_| {
-            *syncing.borrow_mut() = false;
-        }),
+pub fn begin_sync(
+    io: Arc<IOManager>,
+    db_file: Arc<dyn DatabaseStorage>,
+    syncing: Arc<AtomicBool>,
+) -> Result<()> {
+    // assert not already syncing & enter syncing state
+    assert!(!syncing.swap(true, Ordering::Relaxed));
+    let completion = io.prepare_sync(move |_| {
+        syncing.store(false, Ordering::Relaxed);
     });
     db_file.sync(completion)?;
     Ok(())
@@ -1332,26 +1304,21 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
     payload.extend_from_slice(&varint[0..n]);
 }
 
-pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<SpinLock<WalHeader>>> {
-    let drop_fn = Rc::new(|_buf| {});
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
+pub fn begin_read_wal_header(
+    io: Arc<IOManager>,
+    file: &Arc<dyn File>,
+) -> Result<Arc<SpinLock<WalHeader>>> {
     let result = Arc::new(SpinLock::new(WalHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = io.prepare_read_page(None, move |buf: BufferRef| {
         let header = header.clone();
         finish_read_wal_header(buf, header).unwrap();
     });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    io.pread(0, c)?;
+    file.pread(0, complete)?;
     Ok(result)
 }
 
-fn finish_read_wal_header(
-    buf: Arc<RefCell<Buffer>>,
-    header: Arc<SpinLock<WalHeader>>,
-) -> Result<()> {
-    let buf = buf.borrow();
+fn finish_read_wal_header(buf: BufferRef, header: Arc<SpinLock<WalHeader>>) -> Result<()> {
     let buf = buf.as_slice();
     let mut header = header.lock();
     header.magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
@@ -1366,9 +1333,9 @@ fn finish_read_wal_header(
 }
 
 pub fn begin_read_wal_frame(
-    io: &Arc<dyn File>,
+    io: Arc<IOManager>,
+    file: &Arc<dyn File>,
     offset: usize,
-    buffer_pool: Rc<BufferPool>,
     page: PageRef,
 ) -> Result<()> {
     trace!(
@@ -1376,29 +1343,22 @@ pub fn begin_read_wal_frame(
         offset,
         page.get().id
     );
-    let buf = buffer_pool.get();
-    let drop_fn = Rc::new(move |buf| {
-        let buffer_pool = buffer_pool.clone();
-        buffer_pool.put(buf);
-    });
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     let frame = page.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = io.prepare_read_page(None, move |buf: BufferRef| {
         let frame = frame.clone();
         finish_read_page(page.get().id, buf, frame).unwrap();
     });
-    let c = Completion::Read(ReadCompletion::new(buf, complete));
-    io.pread(offset, c)?;
+    file.pread(offset, complete)?;
     Ok(())
 }
 
 pub fn begin_write_wal_frame(
-    io: &Arc<dyn File>,
+    io: Arc<IOManager>,
+    file: &Arc<dyn File>,
     offset: usize,
     page: &PageRef,
     db_size: u32,
-    write_counter: Rc<RefCell<usize>>,
+    write_counter: Arc<AtomicUsize>,
     wal_header: &WalHeader,
     checksums: (u32, u32),
 ) -> Result<(u32, u32)> {
@@ -1417,12 +1377,8 @@ pub fn begin_write_wal_frame(
     let (buffer, checksums) = {
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
-        let drop_fn = Rc::new(|_buf| {});
 
-        let mut buffer = Buffer::allocate(
-            contents.buffer.borrow().len() + WAL_FRAME_HEADER_SIZE,
-            drop_fn,
-        );
+        let mut buffer = io.buf_with_size(contents.buffer.len() + WAL_FRAME_HEADER_SIZE);
         let buf = buffer.as_mut_slice();
         buf[0..4].copy_from_slice(&header.page_number.to_be_bytes());
         buf[4..8].copy_from_slice(&header.db_size.to_be_bytes());
@@ -1453,16 +1409,17 @@ pub fn begin_write_wal_frame(
         buf[20..24].copy_from_slice(&header.checksum_2.to_be_bytes());
 
         #[allow(clippy::arc_with_non_send_sync)]
-        (Arc::new(RefCell::new(buffer)), final_checksum)
+        (buffer, final_checksum)
     };
 
-    *write_counter.borrow_mut() += 1;
+    write_counter.fetch_add(1, Ordering::Relaxed);
+    let wc = write_counter.clone();
     let write_complete = {
         let buf_copy = buffer.clone();
-        Box::new(move |bytes_written: i32| {
+        io.prepare_write_page(move |bytes_written: i32| {
             let buf_copy = buf_copy.clone();
-            let buf_len = buf_copy.borrow().len();
-            *write_counter.borrow_mut() -= 1;
+            let buf_len = buf_copy.len();
+            wc.fetch_sub(1, Ordering::Relaxed);
 
             page_finish.clear_dirty();
             if bytes_written < buf_len as i32 {
@@ -1470,17 +1427,18 @@ pub fn begin_write_wal_frame(
             }
         })
     };
-    let c = Completion::Write(WriteCompletion::new(write_complete));
-    io.pwrite(offset, buffer.clone(), c)?;
+    file.pwrite(offset, buffer.clone(), write_complete)?;
     trace!("Frame written and synced at offset={offset}");
     Ok(checksums)
 }
 
-pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<()> {
+pub fn begin_write_wal_header(
+    io: Arc<IOManager>,
+    file: &Arc<dyn File>,
+    header: &WalHeader,
+) -> Result<()> {
     let buffer = {
-        let drop_fn = Rc::new(|_buf| {});
-
-        let mut buffer = Buffer::allocate(512, drop_fn);
+        let buffer = io.buf_with_size(WAL_HEADER_SIZE);
         let buf = buffer.as_mut_slice();
 
         buf[0..4].copy_from_slice(&header.magic.to_be_bytes());
@@ -1491,22 +1449,17 @@ pub fn begin_write_wal_header(io: &Arc<dyn File>, header: &WalHeader) -> Result<
         buf[20..24].copy_from_slice(&header.salt_2.to_be_bytes());
         buf[24..28].copy_from_slice(&header.checksum_1.to_be_bytes());
         buf[28..32].copy_from_slice(&header.checksum_2.to_be_bytes());
-
-        #[allow(clippy::arc_with_non_send_sync)]
-        Arc::new(RefCell::new(buffer))
+        buffer
     };
 
-    let write_complete = {
-        Box::new(move |bytes_written: i32| {
-            if bytes_written < WAL_HEADER_SIZE as i32 {
-                tracing::error!(
-                    "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
-                );
-            }
-        })
-    };
-    let c = Completion::Write(WriteCompletion::new(write_complete));
-    io.pwrite(0, buffer.clone(), c)?;
+    let write_complete = io.prepare_write_page(move |bytes_written: i32| {
+        if bytes_written < WAL_HEADER_SIZE as i32 {
+            tracing::error!(
+                "wal header wrote({bytes_written}) less than expected({WAL_HEADER_SIZE})"
+            );
+        }
+    });
+    file.pwrite(0, buffer.clone(), write_complete)?;
     Ok(())
 }
 

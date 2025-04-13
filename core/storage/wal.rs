@@ -1,23 +1,21 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::collections::HashMap;
 use tracing::{debug, trace};
 
 use std::fmt::Formatter;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::{fmt, sync::Arc};
 
 use crate::fast_lock::SpinLock;
-use crate::io::{File, SyncCompletion, IO};
+use crate::io::{File, IOManager};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::{Buffer, LimboError, Result};
-use crate::{Completion, Page};
+use crate::Page;
+use crate::{LimboError, Result};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
-
-use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, begin_write_btree_page, WalHeader};
 
@@ -165,21 +163,21 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()>;
+    fn read_frame(&self, frame_id: u64, page: PageRef) -> Result<()>;
 
     /// Write a frame to the WAL.
     fn append_frame(
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<AtomicUsize>,
     ) -> Result<()>;
 
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<AtomicUsize>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus>;
     fn sync(&mut self) -> Result<CheckpointStatus>;
@@ -241,11 +239,10 @@ impl fmt::Debug for OngoingCheckpoint {
 
 #[allow(dead_code)]
 pub struct WalFile {
-    io: Arc<dyn IO>,
-    buffer_pool: Rc<BufferPool>,
+    io: Arc<IOManager>,
 
-    sync_state: RefCell<SyncState>,
-    syncing: Rc<RefCell<bool>>,
+    sync_state: Cell<SyncState>,
+    syncing: Arc<AtomicBool>,
     page_size: usize,
 
     shared: Arc<UnsafeCell<WalFileShared>>,
@@ -424,14 +421,14 @@ impl Wal for WalFile {
     }
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()> {
+    fn read_frame(&self, frame_id: u64, page: PageRef) -> Result<()> {
         debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         begin_read_wal_frame(
+            self.io.clone(),
             &self.get_shared().file,
             offset + WAL_FRAME_HEADER_SIZE,
-            buffer_pool,
             page,
         )?;
         Ok(())
@@ -442,7 +439,7 @@ impl Wal for WalFile {
         &mut self,
         page: PageRef,
         db_size: u32,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<AtomicUsize>,
     ) -> Result<()> {
         let page_id = page.get().id;
         let shared = self.get_shared();
@@ -459,6 +456,7 @@ impl Wal for WalFile {
         let header = header.lock();
         let checksums = shared.last_checksum;
         let checksums = begin_write_wal_frame(
+            self.io.clone(),
             &shared.file,
             offset,
             &page,
@@ -492,7 +490,7 @@ impl Wal for WalFile {
     fn checkpoint(
         &mut self,
         pager: &Pager,
-        write_counter: Rc<RefCell<usize>>,
+        write_counter: Arc<AtomicUsize>,
         mode: CheckpointMode,
     ) -> Result<CheckpointStatus> {
         assert!(
@@ -561,11 +559,7 @@ impl Wal for WalFile {
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
 
-                            self.read_frame(
-                                *frame,
-                                self.ongoing_checkpoint.page.clone(),
-                                self.buffer_pool.clone(),
-                            )?;
+                            self.read_frame(*frame, self.ongoing_checkpoint.page.clone())?;
                             self.ongoing_checkpoint.state = CheckpointState::WaitReadFrame;
                             self.ongoing_checkpoint.current_page += 1;
                             continue 'checkpoint_loop;
@@ -590,7 +584,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
                 }
                 CheckpointState::WaitWritePage => {
-                    if *write_counter.borrow() > 0 {
+                    if write_counter.load(Ordering::SeqCst) > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
                     let shared = self.get_shared();
@@ -603,7 +597,7 @@ impl Wal for WalFile {
                     }
                 }
                 CheckpointState::Done => {
-                    if *write_counter.borrow() > 0 {
+                    if write_counter.load(Ordering::Relaxed) > 0 {
                         return Ok(CheckpointStatus::IO);
                     }
                     let shared = self.get_shared();
@@ -637,19 +631,17 @@ impl Wal for WalFile {
     }
 
     fn sync(&mut self) -> Result<CheckpointStatus> {
-        let state = *self.sync_state.borrow();
+        let state = self.sync_state.get();
         match state {
             SyncState::NotSyncing => {
                 let shared = self.get_shared();
                 debug!("wal_sync");
                 {
                     let syncing = self.syncing.clone();
-                    *syncing.borrow_mut() = true;
-                    let completion = Completion::Sync(SyncCompletion {
-                        complete: Box::new(move |_| {
-                            debug!("wal_sync finish");
-                            *syncing.borrow_mut() = false;
-                        }),
+                    syncing.store(true, Ordering::SeqCst);
+                    let completion = self.io.prepare_sync(move |_| {
+                        debug!("wal_sync finish");
+                        syncing.store(false, Ordering::SeqCst);
                     });
                     shared.file.sync(completion)?;
                 }
@@ -657,7 +649,7 @@ impl Wal for WalFile {
                 Ok(CheckpointStatus::IO)
             }
             SyncState::Syncing => {
-                if *self.syncing.borrow() {
+                if self.syncing.load(Ordering::Relaxed) {
                     Ok(CheckpointStatus::IO)
                 } else {
                     self.sync_state.replace(SyncState::NotSyncing);
@@ -686,23 +678,13 @@ impl Wal for WalFile {
 
 impl WalFile {
     pub fn new(
-        io: Arc<dyn IO>,
+        io: Arc<IOManager>,
         page_size: usize,
         shared: Arc<UnsafeCell<WalFileShared>>,
-        buffer_pool: Rc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
-        let buffer = buffer_pool.get();
-        {
-            let buffer_pool = buffer_pool.clone();
-            let drop_fn = Rc::new(move |buf| {
-                buffer_pool.put(buf);
-            });
-            checkpoint_page.get().contents = Some(PageContent::new(
-                0,
-                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
-            ));
-        }
+        let buffer = io.allocate_page();
+        checkpoint_page.get().contents = Some(PageContent::new(0, buffer));
         Self {
             io,
             shared,
@@ -713,11 +695,10 @@ impl WalFile {
                 max_frame: 0,
                 current_page: 0,
             },
-            syncing: Rc::new(RefCell::new(false)),
+            syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_threshold: 1000,
             page_size,
-            buffer_pool,
-            sync_state: RefCell::new(SyncState::NotSyncing),
+            sync_state: Cell::new(SyncState::NotSyncing),
             max_frame: 0,
             min_frame: 0,
             max_frame_read_lock_index: 0,
@@ -740,13 +721,13 @@ impl WalFile {
 
 impl WalFileShared {
     pub fn open_shared(
-        io: &Arc<dyn IO>,
+        io: Arc<IOManager>,
         path: &str,
         page_size: u16,
     ) -> Result<Arc<UnsafeCell<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
         let header = if file.size()? > 0 {
-            let wal_header = match sqlite3_ondisk::begin_read_wal_header(&file) {
+            let wal_header = match sqlite3_ondisk::begin_read_wal_header(io.clone(), &file) {
                 Ok(header) => header,
                 Err(err) => return Err(LimboError::ParseError(err.to_string())),
             };
@@ -783,7 +764,7 @@ impl WalFileShared {
             );
             wal_header.checksum_1 = checksums.0;
             wal_header.checksum_2 = checksums.1;
-            sqlite3_ondisk::begin_write_wal_header(&file, &wal_header)?;
+            sqlite3_ondisk::begin_write_wal_header(io.clone(), &file, &wal_header)?;
             Arc::new(SpinLock::new(wal_header))
         };
         let checksum = {

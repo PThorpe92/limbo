@@ -33,7 +33,7 @@ pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring"))]
 pub use io::UringIO;
 pub use io::{
-    Buffer, Completion, File, MemoryIO, OpenFlags, PlatformIO, SyscallIO, WriteCompletion, IO,
+    Completion, File, IOManager, MemoryIO, OpenFlags, PlatformIO, SyscallIO, WriteCompletion, IO,
 };
 use limbo_ext::{ResultCode, VTabKind, VTabModuleImpl};
 use limbo_sqlite3_parser::{ast, ast::Cmd, lexer::sql::Parser};
@@ -47,13 +47,16 @@ use std::{
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    },
 };
 use storage::btree::btree_init_page;
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
 pub use storage::{
-    buffer_pool::BufferPool,
+    buffer_pool::{BufferPool, BufferRef},
     database::DatabaseStorage,
     pager::PageRef,
     pager::{Page, Pager},
@@ -78,7 +81,7 @@ enum TransactionState {
     Read,
     None,
 }
-
+pub const DEFAULT_PAGE_SIZE: u16 = 4096;
 pub(crate) type MvStore = crate::mvcc::MvStore<crate::mvcc::LocalClock>;
 
 pub(crate) type MvCursor = crate::mvcc::cursor::ScanCursor<crate::mvcc::LocalClock>;
@@ -89,7 +92,7 @@ pub struct Database {
     // TODO: make header work without lock
     header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
-    io: Arc<dyn IO>,
+    io: Arc<IOManager>,
     page_size: u16,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
@@ -103,27 +106,34 @@ unsafe impl Sync for Database {}
 impl Database {
     #[cfg(feature = "fs")]
     pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
+        use io::IOManager;
         use storage::wal::WalFileShared;
 
         let file = io.open_file(path, OpenFlags::Create, true)?;
-        maybe_init_database_file(&file, &io)?;
+        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 32);
+        maybe_init_database_file(&file, &io_mgr)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         let wal_path = format!("{}-wal", path);
-        let db_header = Pager::begin_open(db_file.clone())?;
+        let db_header = Pager::begin_open(io_mgr.clone(), db_file.clone())?;
         io.run_once()?;
         let page_size = db_header.lock().page_size;
-        let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
-        Self::open(io, db_file, wal_shared, enable_mvcc)
+        let io_mgr = if page_size != DEFAULT_PAGE_SIZE {
+            IOManager::new(io.clone(), page_size as usize, 32)
+        } else {
+            io_mgr
+        };
+        let wal_shared = WalFileShared::open_shared(io_mgr.clone(), wal_path.as_str(), page_size)?;
+        Self::open(io_mgr.clone(), db_file, wal_shared, enable_mvcc)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(
-        io: Arc<dyn IO>,
+        io: Arc<IOManager>,
         db_file: Arc<dyn DatabaseStorage>,
         shared_wal: Arc<UnsafeCell<WalFileShared>>,
         enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
-        let db_header = Pager::begin_open(db_file.clone())?;
+        let db_header = Pager::begin_open(io.clone(), db_file.clone())?;
         io.run_once()?;
         DATABASE_VERSION.get_or_init(|| {
             let version = db_header.lock().version_number;
@@ -172,13 +182,10 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
-
         let wal = Rc::new(RefCell::new(WalFile::new(
             self.io.clone(),
             self.page_size as usize,
             self.shared_wal.clone(),
-            buffer_pool.clone(),
         )));
         let pager = Rc::new(Pager::finish_open(
             self.header.clone(),
@@ -186,7 +193,6 @@ impl Database {
             Some(wal),
             self.io.clone(),
             self.shared_page_cache.clone(),
-            buffer_pool,
         )?);
         let conn = Rc::new(Connection {
             _db: self.clone(),
@@ -233,15 +239,11 @@ impl Database {
     }
 }
 
-pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Result<()> {
+pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<IOManager>) -> Result<()> {
     if file.size()? == 0 {
         // init db
         let db_header = DatabaseHeader::default();
-        let page1 = allocate_page(
-            1,
-            &Rc::new(BufferPool::new(db_header.page_size as usize)),
-            DATABASE_HEADER_SIZE,
-        );
+        let page1 = allocate_page(1, DATABASE_HEADER_SIZE, io);
         {
             // Create the sqlite_schema table, for this we just need to create the btree page
             // for the first page of the database which is basically like any other btree page
@@ -257,18 +259,18 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
             let contents = page1.get().contents.as_mut().unwrap();
             contents.write_database_header(&db_header);
             // write the first page to disk synchronously
-            let flag_complete = Rc::new(RefCell::new(false));
+            let flag_complete = Arc::new(AtomicBool::new(false));
             {
                 let flag_complete = flag_complete.clone();
                 let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
-                    *flag_complete.borrow_mut() = true;
+                    flag_complete.store(true, Ordering::Relaxed);
                 })));
                 file.pwrite(0, contents.buffer.clone(), completion)?;
             }
             let mut limit = 100;
             loop {
                 io.run_once()?;
-                if *flag_complete.borrow() {
+                if flag_complete.load(Ordering::Relaxed) {
                     break;
                 }
                 limit -= 1;
