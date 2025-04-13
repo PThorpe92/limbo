@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::IO;
@@ -9,11 +9,8 @@ pub struct BufferPool {
     page_size: usize,
     buffers: RwLock<Vec<Arc<Buffer>>>,
     in_use: RwLock<Vec<AtomicBool>>,
-    next_id: AtomicUsize,
+    next_id: AtomicU16,
 }
-
-unsafe impl Send for BufferPool {}
-unsafe impl Sync for BufferPool {}
 
 pub type BufferData = Pin<Box<[u8]>>;
 
@@ -21,11 +18,11 @@ pub type BufferData = Pin<Box<[u8]>>;
 struct Buffer {
     pub data: BufferData,
     pub pool: Weak<BufferPool>,
-    id: usize,
+    id: u16,
 }
 pub type BufferRef = Arc<BufferRefInner>;
 
-/// BufferRef is a logical reference to a buffer in the pool.
+/// BufferRef is a reference to a buffer in the pool, with a logical 'len'
 /// All IO operations are done with this object.
 #[derive(Debug)]
 pub struct BufferRefInner {
@@ -38,13 +35,24 @@ impl BufferRefInner {
         Self { len, buf }
     }
 
+    pub fn new_temp(len: usize) -> BufferRef {
+        BufferRef::new(BufferRefInner {
+            len,
+            buf: Arc::new(Buffer {
+                data: Pin::new(vec![0; len].into_boxed_slice()),
+                pool: Weak::new(),
+                id: u16::MAX,
+            }),
+        })
+    }
+
     /// Creates a new BufferRef with a copy of the original data
     pub fn new_cloned(&self) -> Self {
         Self {
             buf: Arc::new(Buffer {
                 data: self.buf.data.clone(),
                 pool: Weak::new(),
-                id: usize::MAX,
+                id: u16::MAX,
             }),
             len: self.len,
         }
@@ -54,7 +62,7 @@ impl BufferRefInner {
     }
 
     pub fn id(&self) -> u16 {
-        self.buf.id as u16
+        self.buf.id
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -79,7 +87,7 @@ impl Drop for BufferRefInner {
         } else {
             assert_eq!(
                 self.buf.id,
-                usize::MAX,
+                u16::MAX,
                 "only copy buffers with this ID will not have a weak ref to the pool"
             );
         }
@@ -92,39 +100,48 @@ impl BufferPool {
             page_size,
             buffers: RwLock::new(Vec::with_capacity(initial)),
             in_use: RwLock::new(Vec::with_capacity(initial)),
-            next_id: AtomicUsize::new(0),
+            next_id: AtomicU16::new(0),
         });
-
-        pool.expand(io, initial);
+        pool.expand(io);
         pool
     }
 
     pub fn get(self: &Arc<Self>, io: &Arc<dyn IO>, len: Option<usize>) -> BufferRef {
-        let in_use = self.in_use.read();
-        for (id, used) in in_use.iter().enumerate() {
-            if used
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                tracing::trace!("getting buffer with id: {id}");
-                return Arc::new(BufferRefInner::new(
-                    len.unwrap_or(self.page_size),
-                    self.buffers.read().get(id).unwrap().clone(),
-                ));
+        {
+            let in_use = self.in_use.read();
+            if len.is_some_and(|l| l > self.page_size) {
+                return BufferRefInner::new_temp(len.unwrap());
+            };
+            for (id, used) in in_use.iter().enumerate() {
+                if used
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    tracing::trace!("getting buffer with id: {id}");
+                    return Arc::new(BufferRefInner::new(
+                        len.unwrap_or(self.page_size),
+                        self.buffers.read().get(id).unwrap().clone(),
+                    ));
+                }
             }
         }
-        self.expand(io.clone(), in_use.len() * 2);
+        self.expand(io.clone());
         self.get(io, len)
     }
 
-    pub fn put(&self, id: usize) {
+    pub fn put(&self, id: u16) {
         tracing::trace!("putting buffer: {id}");
-        self.in_use.read()[id].store(false, Ordering::Release);
+        self.in_use.read()[id as usize].store(false, Ordering::Release);
     }
 
-    pub fn expand(self: &Arc<Self>, io: Arc<dyn IO>, count: usize) {
+    pub fn expand(self: &Arc<Self>, io: Arc<dyn IO>) {
         let mut buffers = self.buffers.write();
         let mut in_use = self.in_use.write();
+        let count = if in_use.is_empty() {
+            in_use.capacity()
+        } else {
+            in_use.len()
+        };
         tracing::trace!("expanding buffer pool by {count}");
         let mut iovecs = Vec::with_capacity(count);
         for _ in 0..count {
@@ -134,7 +151,8 @@ impl BufferPool {
                 id,
                 pool: Arc::downgrade(self),
             };
-            iovecs.push((id as u16, buf.data.as_ptr(), self.page_size));
+            tracing::trace!("creating buffer with id: {}", id);
+            iovecs.push((id, buf.data.as_ptr(), self.page_size));
             buffers.push(Arc::new(buf));
             in_use.push(AtomicBool::new(false));
         }

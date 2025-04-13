@@ -91,7 +91,7 @@ impl File for SimulatorFile {
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<RefCell<limbo_core::Buffer>>,
+        buffer: limbo_core::BufferRef,
         c: limbo_core::Completion,
     ) -> Result<()> {
         *self.nr_pwrite_calls.borrow_mut() += 1;

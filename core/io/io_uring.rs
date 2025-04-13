@@ -65,7 +65,7 @@ impl UringIO {
         };
         let sub = ring.submitter();
         sub.register_files_sparse(2)?; // WAL + db file
-        sub.register_buffers_sparse(32)?; // default buffer pool size
+        sub.register_buffers_sparse(512)?; // to account for growing
         let inner = InnerUringIO {
             ring: WrappedIOUring {
                 ring,
@@ -78,6 +78,7 @@ impl UringIO {
         };
         debug!("Using IO backend 'io-uring'");
         Ok(Self {
+            #[allow(clippy::arc_with_non_send_sync)]
             inner: Arc::new(UnsafeCell::new(inner)),
         })
     }
@@ -296,10 +297,23 @@ impl File for UringFile {
         let read_e = {
             let len = r.len();
             let buf = r.buf_ptr();
-            io_uring::opcode::ReadFixed::new(types::Fixed(self.fd_idx), buf, len as u32, r.0.id())
+            match r.0.id() {
+                u16::MAX => {
+                    io_uring::opcode::Read::new(types::Fd(self.file.as_raw_fd()), buf, len as u32)
+                        .offset(pos as u64)
+                        .build()
+                        .user_data(io.ring.get_key())
+                }
+                _ => io_uring::opcode::ReadFixed::new(
+                    types::Fixed(self.fd_idx),
+                    buf,
+                    len as u32,
+                    r.0.id(),
+                )
                 .offset(pos as u64)
                 .build()
-                .user_data(io.ring.get_key())
+                .user_data(io.ring.get_key()),
+            }
         };
         io.ring.submit_entry(&read_e, c);
         Ok(())
@@ -309,15 +323,27 @@ impl File for UringFile {
         let io = unsafe { &mut *self.io.get() };
         let write = {
             trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
-            io_uring::opcode::WriteFixed::new(
-                types::Fixed(self.fd_idx),
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                buffer.id(),
-            )
-            .offset(pos as u64)
-            .build()
-            .user_data(io.ring.get_key())
+            match buffer.id() {
+                // this is a one-off ephemeral buffer (cold path)
+                u16::MAX => io_uring::opcode::Write::new(
+                    types::Fd(self.file.as_raw_fd()),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                )
+                .offset(pos as u64)
+                .build()
+                .user_data(io.ring.get_key()),
+                // fixed, pre-registered buffer
+                _ => io_uring::opcode::WriteFixed::new(
+                    types::Fixed(self.fd_idx),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    buffer.id(),
+                )
+                .offset(pos as u64)
+                .build()
+                .user_data(io.ring.get_key()),
+            }
         };
         let mut c = Some(c);
         let completion = Completion::Write(WriteCompletion::new(Box::new({

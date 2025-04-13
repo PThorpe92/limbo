@@ -36,8 +36,11 @@ grep -v '^--' "$CLICKBENCH_DIR/queries.sql" | while read -r query; do
     ((echo "$count $query") 2>&1) | tee -a clickbench-sqlite3.txt >/dev/null
     for _ in $(seq 1 $TRIES); do
         clear_caches
-        echo "----limbo----"
-        ((time "$RELEASE_BUILD_DIR/limbo" --quiet "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-limbo.txt
+        echo "----limbo----\n----IO_URING----"
+        ((time "$RELEASE_BUILD_DIR/limbo --vfs io_uring" --quiet "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-limbo-uring.txt
+        clear_caches
+        echo "----limbo----\n----SYSCALL----"
+        ((time "$RELEASE_BUILD_DIR/limbo --vfs syscall" --quiet "$CLICKBENCH_DIR/mydb" <<< "${query}") 2>&1) | tee -a clickbench-limbo-syscall.txt
         clear_caches
         echo
         echo "----sqlite----"

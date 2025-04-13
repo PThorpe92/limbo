@@ -43,7 +43,7 @@
 
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Completion, IOManager, ReadCompletion, WriteCompletion};
+use crate::io::IOManager;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::pager::Pager;
 use crate::types::{ImmutableRecord, RawSlice, RefValue, TextRef, TextSubtype};
@@ -703,7 +703,6 @@ pub fn begin_read_page(
 ) -> Result<()> {
     trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let complete = io.prepare_read_page(None, move |buf: BufferRef| {
-        let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
         }
@@ -748,17 +747,15 @@ pub fn begin_write_btree_page(
 
     write_counter.fetch_add(1, Ordering::Relaxed);
     let wc = write_counter.clone();
+    let len = buffer.len();
     let write_complete = {
-        let buf_copy = buffer.clone();
         pager.io.prepare_write_page(move |bytes_written: i32| {
             trace!("finish_write_btree_page");
-            let buf_copy = buf_copy.clone();
-            let buf_len = buf_copy.len();
             wc.fetch_sub(1, Ordering::Relaxed);
 
             page_finish.clear_dirty();
-            if bytes_written < buf_len as i32 {
-                tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
+            if bytes_written < len as i32 {
+                tracing::error!("wrote({bytes_written}) less than expected({len})");
             }
         })
     };
@@ -1310,9 +1307,8 @@ pub fn begin_read_wal_header(
 ) -> Result<Arc<SpinLock<WalHeader>>> {
     let result = Arc::new(SpinLock::new(WalHeader::default()));
     let header = result.clone();
-    let complete = io.prepare_read_page(None, move |buf: BufferRef| {
-        let header = header.clone();
-        finish_read_wal_header(buf, header).unwrap();
+    let complete = io.prepare_read_page(Some(128), move |buf: BufferRef| {
+        finish_read_wal_header(buf, header.clone()).unwrap();
     });
     file.pread(0, complete)?;
     Ok(result)
@@ -1343,10 +1339,8 @@ pub fn begin_read_wal_frame(
         offset,
         page.get().id
     );
-    let frame = page.clone();
     let complete = io.prepare_read_page(None, move |buf: BufferRef| {
-        let frame = frame.clone();
-        finish_read_page(page.get().id, buf, frame).unwrap();
+        finish_read_page(page.get().id, buf, page.clone()).unwrap();
     });
     file.pread(offset, complete)?;
     Ok(())
@@ -1378,7 +1372,7 @@ pub fn begin_write_wal_frame(
         let page = page.get();
         let contents = page.contents.as_ref().unwrap();
 
-        let mut buffer = io.buf_with_size(contents.buffer.len() + WAL_FRAME_HEADER_SIZE);
+        let buffer = io.buf_with_size(contents.buffer.len() + WAL_FRAME_HEADER_SIZE);
         let buf = buffer.as_mut_slice();
         buf[0..4].copy_from_slice(&header.page_number.to_be_bytes());
         buf[4..8].copy_from_slice(&header.db_size.to_be_bytes());

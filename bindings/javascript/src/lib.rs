@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use limbo_core::{Clock, Instant};
+use limbo_core::{Clock, Instant, DEFAULT_PAGE_SIZE};
 use napi::{Env, JsUnknown, Result as NapiResult};
 use napi_derive::napi;
 
@@ -29,9 +29,10 @@ impl Database {
         let file = io
             .open_file(&path, limbo_core::OpenFlags::Create, false)
             .unwrap();
-        limbo_core::maybe_init_database_file(&file, &io).unwrap();
+        let io_mgr = limbo_core::IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 16);
+        limbo_core::maybe_init_database_file(&file, &io_mgr).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
-        let db_header = limbo_core::Pager::begin_open(db_file.clone()).unwrap();
+        let db_header = limbo_core::Pager::begin_open(io_mgr.clone(), db_file.clone()).unwrap();
 
         // ensure db header is there
         io.run_once().unwrap();
@@ -40,9 +41,10 @@ impl Database {
 
         let wal_path = format!("{}-wal", path);
         let wal_shared =
-            limbo_core::WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
+            limbo_core::WalFileShared::open_shared(io_mgr.clone(), wal_path.as_str(), page_size)
+                .unwrap();
 
-        let db = limbo_core::Database::open(io, db_file, wal_shared, false).unwrap();
+        let db = limbo_core::Database::open(io_mgr.clone(), db_file, wal_shared, false).unwrap();
         let conn = db.connect().unwrap();
         Self {
             memory,
@@ -124,7 +126,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        let size = r.buf().len();
+        let size = r.len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(limbo_core::LimboError::NotADB);
@@ -137,10 +139,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: limbo_core::BufferRef,
         c: limbo_core::Completion,
     ) -> limbo_core::Result<()> {
-        let size = buffer.borrow().len();
+        let size = buffer.len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())

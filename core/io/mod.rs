@@ -54,10 +54,6 @@ impl IOManager {
         self.io.run_once()
     }
 
-    pub fn expand_by(&self, pages: usize) {
-        self.buffer_pool.expand(self.io.clone(), pages);
-    }
-
     pub fn allocate_page(&self) -> BufferRef {
         self.buffer_pool.get(&self.io, None)
     }
@@ -97,8 +93,7 @@ pub trait IO: Clock + Send + Sync {
     fn generate_random_number(&self) -> i64;
 
     fn get_memory_io(&self) -> Arc<MemoryIO>;
-
-    fn register_buffers(&self, buffers: &[(u16, *const u8, usize)]) -> Result<()> {
+    fn register_buffers(&self, _buffers: &[(u16, *const u8, usize)]) -> Result<()> {
         Ok(())
     }
 }
@@ -166,7 +161,7 @@ impl SyncCompletion {
     pub fn new(complete: SyncComplete) -> Self {
         Self(complete)
     }
-    pub fn complete(mut self, result: i32) {
+    pub fn complete(self, result: i32) {
         (self.0)(result)
     }
 }

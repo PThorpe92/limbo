@@ -1,7 +1,7 @@
 use js_sys::{Array, Object};
 use limbo_core::{
-    maybe_init_database_file, Clock, IOManager, Instant, OpenFlags, Pager, Result, WalFileShared,
-    DEFAULT_PAGE_SIZE,
+    maybe_init_database_file, BufferRef, Clock, IOManager, Instant, OpenFlags, Pager, Result,
+    WalFileShared, DEFAULT_PAGE_SIZE,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,7 +23,7 @@ impl Database {
         let file = io
             .open_file(path, limbo_core::OpenFlags::Create, false)
             .unwrap();
-        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE, 16);
+        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 16);
         maybe_init_database_file(&file, &io_mgr).unwrap();
         let db_file = Arc::new(DatabaseFile::new(file));
         let db_header = Pager::begin_open(io_mgr.clone(), db_file.clone()).unwrap();
@@ -33,14 +33,16 @@ impl Database {
 
         let page_size = db_header.lock().page_size;
         let io_mgr = if page_size != DEFAULT_PAGE_SIZE {
-            IOManager::new(io.clone(), page_size, 16)
+            IOManager::new(io.clone(), page_size.into(), 16)
         } else {
             io_mgr
         };
-        let wal_path = format!("{}-wal", path);
-        let wal_shared = WalFileShared::open_shared(&io, wal_path.as_str(), page_size).unwrap();
 
-        let db = limbo_core::Database::open(io, db_file, wal_shared, false).unwrap();
+        let wal_path = format!("{}-wal", path);
+        let wal_shared =
+            WalFileShared::open_shared(io_mgr.clone(), wal_path.as_str(), page_size).unwrap();
+
+        let db = limbo_core::Database::open(io_mgr, db_file, wal_shared, false).unwrap();
         let conn = db.connect().unwrap();
         Database { db, conn }
     }
@@ -233,30 +235,24 @@ impl limbo_core::File for File {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        {
-            let mut buf = r.buf_mut();
-            let buf: &mut [u8] = buf.as_mut_slice();
+        let nr = {
+            let buf: &mut [u8] = r.buf_slice();
             let nr = self.vfs.pread(self.fd, buf, pos);
             assert!(nr >= 0);
-        }
-        r.complete();
+            nr
+        };
+        c.complete(nr);
         Ok(())
     }
 
-    fn pwrite(
-        &self,
-        pos: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
-        c: limbo_core::Completion,
-    ) -> Result<()> {
-        let w = match &c {
+    fn pwrite(&self, pos: usize, buffer: BufferRef, c: limbo_core::Completion) -> Result<()> {
+        let _ = match &c {
             limbo_core::Completion::Write(ref w) => w,
             _ => unreachable!(),
         };
-        let buf = buffer.borrow();
-        let buf: &[u8] = buf.as_slice();
+        let buf: &[u8] = buffer.as_slice();
         self.vfs.pwrite(self.fd, buf, pos);
-        w.complete(buf.len() as i32);
+        c.complete(buf.len() as i32);
         Ok(())
     }
 
@@ -355,7 +351,7 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        let size = r.buf().len();
+        let size = r.len();
         assert!(page_idx > 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(limbo_core::LimboError::NotADB);
@@ -368,10 +364,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: BufferRef,
         c: limbo_core::Completion,
     ) -> Result<()> {
-        let size = buffer.borrow().len();
+        let size = buffer.len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())

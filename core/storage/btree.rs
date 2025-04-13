@@ -3382,7 +3382,7 @@ impl BTreeCursor {
             OwnedValue::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let _ = return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
+        return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
         let page = self.stack.top();
         // TODO(pere): request load
         return_if_locked!(page);
@@ -3749,10 +3749,7 @@ impl BTreeCursor {
     }
 
     pub fn is_write_in_progress(&self) -> bool {
-        match self.state {
-            CursorState::Write(_) => true,
-            _ => false,
-        }
+        matches!(self.state, CursorState::Write(_))
     }
 }
 
@@ -4691,15 +4688,16 @@ mod tests {
     use super::*;
     use crate::{
         fast_lock::SpinLock,
-        io::{Buffer, Completion, IOManager, MemoryIO, OpenFlags, IO},
+        io::{Completion, IOManager, MemoryIO, OpenFlags, IO},
         storage::{
+            buffer_pool::BufferRefInner,
             database::DatabaseFile,
             page_cache::DumbLruPageCache,
             sqlite3_ondisk::{self, DatabaseHeader},
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Connection, DatabaseStorage, WalFile, WalFileShared, WriteCompletion,
+        Connection, DatabaseStorage, WalFile, WalFileShared, WriteCompletion,
     };
     use std::{
         cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,
@@ -4708,7 +4706,6 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        io::BufferData,
         storage::{
             btree::{
                 compute_free_space, fill_cell_payload, payload_overflow_threshold_max,
@@ -4727,14 +4724,7 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
-        let inner = PageContent::new(
-            0,
-            Arc::new(RefCell::new(Buffer::new(
-                BufferData::new(vec![0; 4096]),
-                drop_fn,
-            ))),
-        );
+        let inner = PageContent::new(0, BufferRefInner::new_temp(4096));
         page.get().contents.replace(inner);
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
@@ -5320,7 +5310,6 @@ mod tests {
                 db_header.clone(),
                 db_file,
                 Some(wal),
-                wal,
                 io_mgr.clone(),
                 Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10))),
             )
@@ -5347,14 +5336,10 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
-            #[allow(clippy::arc_with_non_send_sync)]
-            let buf = Arc::new(RefCell::new(Buffer::allocate(
-                db_header.lock().page_size as usize,
-                drop_fn,
-            )));
-            let write_complete = Box::new(|_| {});
-            let c = Completion::Write(WriteCompletion::new(write_complete));
+            let buf = pager.io.allocate_page();
+            let c = pager.io.prepare_write_page(move |res: i32| {
+                let _ = res;
+            });
             pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), c)?;

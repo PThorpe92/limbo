@@ -110,7 +110,7 @@ impl Database {
         use storage::wal::WalFileShared;
 
         let file = io.open_file(path, OpenFlags::Create, true)?;
-        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 32);
+        let io_mgr = IOManager::new(io.clone(), DEFAULT_PAGE_SIZE as usize, 128);
         maybe_init_database_file(&file, &io_mgr)?;
         let db_file = Arc::new(DatabaseFile::new(file));
         let wal_path = format!("{}-wal", path);
@@ -118,7 +118,7 @@ impl Database {
         io.run_once()?;
         let page_size = db_header.lock().page_size;
         let io_mgr = if page_size != DEFAULT_PAGE_SIZE {
-            IOManager::new(io.clone(), page_size as usize, 32)
+            IOManager::new(io.clone(), page_size as usize, 128)
         } else {
             io_mgr
         };
