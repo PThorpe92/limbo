@@ -17,6 +17,8 @@ test-update = "cli_tests.update:main"
 test-memory = "cli_tests.memory:main"
 bench-vfs = "cli_tests.vfs_bench:main"
 test-constraint = "cli_tests.constraint:main"
+bench = "cli_tests.release_bench:main"
+
 
 [tool.uv]
 package = true
