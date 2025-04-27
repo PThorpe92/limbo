@@ -1,20 +1,29 @@
 use crate::{Buffer, IO};
 use core::sync::atomic::{AtomicU32, Ordering};
 use parking_lot::Mutex;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
+
+use super::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
 
 pub const MAX_ARENA_PAGES: u32 = 256; // 512MB total max buffer pool size
 pub const DEFAULT_ARENA_SIZE: usize = 2 * 1024 * 1024; // 2MB arenas
 
 #[derive(Debug, Clone)]
+/// A page of memory from an arena used for IO operations.
+/// each has size arena.page_size but has it's own logical size as
+/// requested by pool.get_page which can be <= arena.page_size
 pub struct ArenaBuffer {
+    /// start of the buffer
     ptr: NonNull<u8>,
+    /// logical size
     len: usize,
-    id: u32, // packed (arena, slot)
-    _parent: Weak<Arena>,
+    /// packed identifier: arena, slot
+    id: u32,
+    // arc to ensure that the arena is not deallocated while buffers are in use
+    _parent: Arc<Arena>,
 }
 
 // Buffer pool is responsible for making sure two buffers
@@ -29,7 +38,7 @@ impl ArenaBuffer {
             ptr,
             len,
             id,
-            _parent: Arc::downgrade(arena),
+            _parent: Arc::clone(arena),
         }
     }
 
@@ -49,8 +58,7 @@ impl ArenaBuffer {
 
     /// Mark the buffer as free in the arena.
     pub fn mark_free(&self) {
-        let arena = self._parent.upgrade().expect("Arena dropped");
-        arena.mark_free(self.id);
+        self._parent.mark_free(self.id);
     }
 }
 
@@ -127,10 +135,11 @@ impl Arena {
     }
 
     pub fn mark_free(&self, id: u32) {
-        assert!(self.id == split_id(id).0 && self.page_count > split_id(id).1);
-        tracing::trace!("{} mark_free: id: {}", self.id, id);
-        self.freelist.push(split_id(id).1);
-        if self.in_use.fetch_sub(1, Ordering::Relaxed) == 0 && self.id > 2 {
+        let split = split_id(id);
+        assert!(self.id == split.0 && self.page_count > split.1);
+        tracing::trace!("arena({}: mark_free({}))", self.id, split.1);
+        self.freelist.push(split.1);
+        if self.in_use.fetch_sub(1, Ordering::Relaxed) == 1 && self.id > 2 {
             // this arena was allocated in an overflow, so we can drop the arena to shrink the pool
             let pool = self._parent.upgrade().expect("BufferPool dropped");
             pool.try_reclaim(self.id);
@@ -231,8 +240,11 @@ mod arena {
 /// buffer if no arena is available for the requested size.
 pub struct BufferPool {
     io: Arc<dyn IO>,
-    default_page_size: usize, // e.g. 4096
+    // whatever the default page size is, we will use that plus wal frame header size
+    // for consistency to prevent arenas with multiple page sizes
+    default_page_size: usize,
     next_arena: AtomicU32,
+    rlimit_hit: Cell<bool>,
     arenas: RefCell<Vec<Arc<Arena>>>, // mixed sizes
     expand_guard: Mutex<()>,
 }
@@ -245,65 +257,80 @@ impl BufferPool {
             io,
             default_page_size: default_page,
             next_arena: AtomicU32::new(0),
+            rlimit_hit: Cell::new(false),
             arenas: RefCell::new(Vec::new()),
             expand_guard: Mutex::new(()),
         })
     }
 
-    /// Returns a Buffer for use in IO operations.
-    /// Takes an optional length parameter, returning a page of the pool's
-    /// default page size for the connection if None is provided.
     pub fn get_page(self: &Arc<Self>, len: Option<usize>) -> Arc<Buffer> {
-        let size = len.unwrap_or(self.default_page_size);
-        match self.get(size) {
-            Ok(buf) => {
-                tracing::trace!("BufferPool: get_page: id: {}", buf.io_id());
-                Buffer::new_pooled(buf)
-            }
-            Err(_) => {
-                tracing::trace!("BufferPool: get_page: pool unavailable, using heap buffer");
-                Buffer::new_heap(size)
-            }
+        let len = len.unwrap_or(self.default_page_size);
+        assert!(len <= self.default_page_size + WAL_FRAME_HEADER_SIZE);
+        match self.get(len) {
+            Ok(b) => Buffer::new_pooled(b),
+            Err(_) => Buffer::new_heap(len),
         }
     }
 
-    /// internal: try arena then maybe grow
     fn get(self: &Arc<Self>, len: usize) -> Result<ArenaBuffer, ()> {
-        // fast path: existing arena with arena.page_size >= len
-        {
-            let arenas = self.arenas.borrow();
-            // arenas.length will always be very small, so this linear search is ok
-            for a in arenas.iter().filter(|a| a.page_size >= len) {
-                if let Some(b) = a.try_alloc(len) {
-                    return Ok(b);
-                }
-            }
+        // first pass over existing arenas
+        if let Some(buf) = self.try_existing(len) {
+            return Ok(buf);
         }
-        let psize = len
-            .max(self.default_page_size) // anything smaller gets rounded up to default
-            .min(DEFAULT_ARENA_SIZE);
-        self.add_arena(psize)
+
+        // try to grow the pool
+        if let Ok(buf) = self.try_grow(len) {
+            return Ok(buf);
+        }
+
+        // second pass (pages may have been freed)
+        if let Some(buf) = self.try_existing(len) {
+            return Ok(buf);
+        }
+        Err(())
     }
 
-    // Add an arena to the pool with a default page size, returning a new buffer
-    fn add_arena(self: &Arc<Self>, page_size: usize) -> Result<ArenaBuffer, ()> {
-        // hold guard to prevent expansion while we are adding a new arena
+    #[inline]
+    fn try_existing(&self, len: usize) -> Option<ArenaBuffer> {
+        for a in self.arenas.borrow().iter() {
+            if let Some(b) = a.try_alloc(len) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    fn try_grow(self: &Arc<Self>, len: usize) -> Result<ArenaBuffer, ()> {
+        // if somebody else is already growing the pool we fall back to a heap buffer
         if self.expand_guard.is_locked() {
             return Err(());
         }
+
         let _guard = self.expand_guard.lock();
         let id = self.next_arena.fetch_add(1, Ordering::Relaxed);
         if id >= MAX_ARENAS {
             return Err(());
         }
-        tracing::trace!("add_arena: id: {} with page_size: {}", id, page_size);
-        let arena = Arena::new(self.clone(), id, page_size);
-
-        // map length is always fixed 2 MiB so O_DIRECT will always be aligned
-        self.io
-            .register_buffer(id, (arena.base.as_ptr(), DEFAULT_ARENA_SIZE))
-            .map_err(|_| ())?;
-        let buf = arena.try_alloc(page_size).ok_or(())?;
+        let arena = Arena::new(
+            self.clone(),
+            id,
+            self.default_page_size + WAL_FRAME_HEADER_SIZE,
+        );
+        if !self.rlimit_hit.get() {
+            if let Err(e) = self
+                .io
+                .register_buffer(id, (arena.base.as_ptr(), DEFAULT_ARENA_SIZE))
+            {
+                tracing::warn!("failed to register buffer: {id}\n{e}");
+                // most likely we hit ENOMEM: meaning the rlimit_memlock has been reached for this
+                // process. we can still allocate arenas but we cannot use fixed opcodes for these
+                // buffers, io_uring logs which id's are fixed. we set the flag unconditionally here
+                // because even if the error wasn't ENOMEM, we don't want to make the call again
+                self.rlimit_hit.set(true);
+            }
+        }
+        // hand out one page from the new arena
+        let buf = arena.try_alloc(len).ok_or(())?;
         self.arenas.borrow_mut().push(arena);
         Ok(buf)
     }
@@ -312,14 +339,14 @@ impl BufferPool {
         // we should never be expanding while reclaiming
         assert!(!self.expand_guard.is_locked());
         let mut arenas = self.arenas.borrow_mut();
-        // never shrink below 2 arenas
+        // dont shrink below 2 arenas. these first two arenas are the buffers
+        // that will be registered with io_uring if it's in use
         if arenas.len() <= 2 {
             return;
         }
         if let Some(pos) = arenas.iter().position(|a| a.id == id) {
-            // Acquire ordering to double-check the arena is still idle
-            if arenas[pos].in_use.load(Ordering::Acquire) == 0 && arenas.len() > 2 {
-                tracing::debug!("BufferPool: reclaiming arena {}", id);
+            if arenas[pos].in_use.load(Ordering::Acquire) == 0 {
+                tracing::debug!("reclaiming overflow arena({})", id);
                 // drop the arc, unmaps memory in Arena::drop.
                 arenas.remove(pos);
             }
@@ -389,7 +416,6 @@ impl FreeStack {
     #[inline]
     pub fn push(&self, slot: u32) {
         let mut cur = self.head.load(Ordering::Acquire);
-
         loop {
             unsafe { write_next(self.base, self.page_size, slot, cur) };
             match self
@@ -522,11 +548,8 @@ mod tests {
             let freelist = Arc::clone(&freelist);
             handles.push(thread::spawn(move || {
                 let mut popped = Vec::new();
-                loop {
-                    match freelist.pop() {
-                        Some(slot) => popped.push(slot),
-                        None => break, // freelist exhausted
-                    }
+                while let Some(slot) = freelist.pop() {
+                    popped.push(slot);
                 }
                 popped
             }));

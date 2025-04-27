@@ -95,6 +95,12 @@ impl DumbLruPageCache {
         if clean_page {
             let page = unsafe { &ptr.as_ref().page };
             if page.pinned() || page.is_dirty() {
+                debug!(
+                    "abort_evict_page(id={},pinned={},dirty={})",
+                    page.get().id,
+                    page.pinned(),
+                    page.is_dirty()
+                );
                 // put it back: we cannot evict a pinned page
                 self.map.borrow_mut().insert(key, ptr);
                 return;
@@ -137,7 +143,7 @@ impl DumbLruPageCache {
             // evict buffer
             let page = unsafe { &entry.as_mut().page };
             page.clear_loaded();
-            assert!(!page.pinned());
+            assert!(!page.pinned() && !page.is_dirty());
             debug!("cleaning up page {}", page.get().id);
             let _ = page.get().contents.take();
         }
@@ -200,6 +206,12 @@ impl DumbLruPageCache {
         let tail_entry = unsafe { tail.as_mut() };
         if tail_entry.page.is_dirty() || tail_entry.page.pinned() {
             // TODO: drop from another clean entry?
+            debug!(
+                "not evicting page {} pinned={} dirty={}",
+                tail_entry.page.get().id,
+                tail_entry.page.pinned(),
+                tail_entry.page.is_dirty()
+            );
             return;
         }
         tracing::debug!("pop_if_not_dirty(key={:?})", tail_entry.key);

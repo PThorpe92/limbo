@@ -563,6 +563,7 @@ impl Wal for WalFile {
                             );
                             self.ongoing_checkpoint.page.get().id = page as usize;
                             if *write_counter.borrow() > 0 {
+                                debug!("reading wal frame with checkpoint write_counter > 0");
                                 // we cannot checkpoint if there are writes in progress
                                 return Ok(CheckpointStatus::IO);
                             }
@@ -724,6 +725,11 @@ impl WalFile {
     fn frame_offset(&self, frame_id: u64) -> usize {
         assert!(frame_id > 0, "Frame ID must be 1-based");
         let page_size = self.page_size;
+        trace!(
+            "frame_offset(frame_id={}, page_size={})",
+            frame_id,
+            page_size
+        );
         let page_offset = (frame_id - 1) * (page_size + WAL_FRAME_HEADER_SIZE) as u64;
         let offset = WAL_HEADER_SIZE as u64 + page_offset;
         offset as usize

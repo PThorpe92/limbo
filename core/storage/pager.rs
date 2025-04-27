@@ -29,7 +29,8 @@ pub struct Page {
 }
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
-// because that is bad bad. However, we do our own reference counting to prevent the page cache
+// because that is bad bad.
+// However, we do our own reference counting to prevent the page cache
 // from dropping the page while it's still in use by a cursor.
 pub struct PageRef(Arc<Page>);
 impl PageRef {

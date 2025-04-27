@@ -100,12 +100,12 @@ pub struct Database {
     header: Arc<SpinLock<DatabaseHeader>>,
     db_file: Arc<dyn DatabaseStorage>,
     io: Arc<dyn IO>,
-    buffer_pool: Arc<BufferPool>,
     page_size: u16,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
     shared_wal: Arc<UnsafeCell<WalFileShared>>,
+    buffer_pool: Arc<BufferPool>,
 }
 
 unsafe impl Send for Database {}
@@ -294,7 +294,6 @@ pub fn maybe_init_database_file(
 }
 
 pub struct Connection {
-    _db: Arc<Database>,
     pager: Rc<Pager>,
     schema: Arc<RwLock<Schema>>,
     header: Arc<SpinLock<DatabaseHeader>>,
@@ -305,6 +304,7 @@ pub struct Connection {
     last_change: Cell<i64>,
     total_changes: Cell<i64>,
     syms: RefCell<SymbolTable>,
+    _db: Arc<Database>,
 }
 
 impl Connection {

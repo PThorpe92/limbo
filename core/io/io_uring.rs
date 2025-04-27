@@ -14,8 +14,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-const ENTRIES: u32 = 2048;
-const SQPOLL_IDLE: u32 = 500;
+const ENTRIES: u32 = 1024;
+const SQPOLL_IDLE: u32 = 1000;
 const ACTIVE_FILES: u32 = 2;
 
 #[derive(Debug, Error)]
@@ -52,7 +52,38 @@ struct WrappedIOUring {
 struct InnerUringIO {
     ring: WrappedIOUring,
     files: AtomicU32,
-    buffers: AtomicU32,
+    buffer_offset: AtomicU32,
+    // io_id's of buffers we can use fixed opcodes for
+    registered_buffers: u64,
+}
+
+impl InnerUringIO {
+    fn mark_registered_buffer(&mut self, id: u32) {
+        // set the bit for the buffer id to 1
+        self.registered_buffers |= 1 << id;
+        trace!(
+            "mark_registered_buffer(id = {id}, registered_mask = {})",
+            self.registered_buffers
+        );
+    }
+
+    fn clear_registered_buffers(&mut self) {
+        // clear the bit for the buffer id to 0
+        self.registered_buffers = 0;
+    }
+
+    fn buffer_is_registered(&self, id: Option<u32>) -> bool {
+        match id {
+            Some(id) => {
+                trace!(
+                    "buffer_is_registered(id={id}, registered_mask={})",
+                    self.registered_buffers
+                );
+                self.registered_buffers & (1 << id) != 0
+            }
+            None => false,
+        }
+    }
 }
 
 impl UringIO {
@@ -77,7 +108,8 @@ impl UringIO {
                 key: 0,
             },
             files: AtomicU32::new(0),
-            buffers: AtomicU32::new(0),
+            buffer_offset: AtomicU32::new(0),
+            registered_buffers: 0,
         };
         debug!("Using IO backend 'io-uring'");
         #[allow(clippy::arc_with_non_send_sync)]
@@ -121,8 +153,8 @@ impl WrappedIOUring {
                 .expect("submission queue is full");
         }
         self.pending_ops += 1;
-        if self.pending_ops == ENTRIES as usize {
-            self.ring.submit().expect("failed to submit");
+        if self.pending_ops % 128 == 0 {
+            self.ring.submit_and_wait(1).expect("failed to submit");
         }
     }
 
@@ -211,17 +243,20 @@ impl IO for UringIO {
         Ok(())
     }
 
-    fn register_buffer(&self, arena_id: u32, iovec: (*const u8, usize)) -> Result<()> {
-        let inner = unsafe { &*self.inner.get() };
-        let mut offset = inner.buffers.fetch_add(1, Ordering::SeqCst);
-        println!("register_buffer: arena_id = {arena_id}, offset = {offset}");
+    fn register_buffer(&self, arena_id: u32, iovec: (*const u8, usize)) -> std::io::Result<()> {
+        let inner = unsafe { &mut *self.inner.get() };
+        let mut offset = inner.buffer_offset.fetch_add(1, Ordering::Relaxed);
+        trace!("register_buffer: arena_id = {arena_id}, offset = {offset}");
         if arena_id != offset {
             // this means that a new connection + buffer pool is reusing the IO, so we can overwrite
             // the earlier buffers by calling update on previously registered indexes.
-            inner.buffers.store(1, Ordering::Relaxed);
+            trace!("register_buffer: arena_id != offset, rewriting buffers");
+            // store 1 so the current buffer takes the first index.
+            inner.buffer_offset.store(1, Ordering::Relaxed);
             offset = 0;
+            inner.clear_registered_buffers();
+            inner.ring.ring.submitter().unregister_buffers()?;
         }
-        assert_eq!(arena_id, offset, "arena_id is not the expected offset");
         unsafe {
             inner.ring.ring.submitter().register_buffers_update(
                 offset,
@@ -230,8 +265,10 @@ impl IO for UringIO {
                     iov_len: iovec.1,
                 }],
                 None,
-            )?
-        };
+            )
+        }?;
+        // store the buffer id if registration successful
+        inner.mark_registered_buffer(arena_id);
         Ok(())
     }
 
@@ -311,13 +348,14 @@ impl File for UringFile {
             let len = r.buf.len();
             let ptr = r.buf.as_ptr() as *mut u8;
             assert!(!ptr.is_null());
-            if let Some(id) = r.buf.arena_id() {
+            let id = r.buf.arena_id();
+            if io.buffer_is_registered(id) {
                 trace!("pread_fixed(pos = {}, length = {})", pos, r.buf.len());
                 io_uring::opcode::ReadFixed::new(
                     io_uring::types::Fixed(self.id),
                     ptr,
                     len as u32,
-                    id as u16,
+                    id.unwrap() as u16,
                 )
                 .offset(pos as u64)
                 .build()
@@ -339,13 +377,14 @@ impl File for UringFile {
         let io = unsafe { &mut *self.io.get() };
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
         let write = {
-            if let Some(id) = buffer.arena_id() {
+            let id = buffer.arena_id();
+            if io.buffer_is_registered(id) {
                 trace!("pwrite_fixed(pos = {}, length = {})", pos, buffer.len());
                 io_uring::opcode::WriteFixed::new(
                     io_uring::types::Fixed(self.id),
                     buffer.as_ptr(),
                     buffer.len() as u32,
-                    id as u16,
+                    id.unwrap() as u16,
                 )
                 .offset(pos as u64)
                 .build()

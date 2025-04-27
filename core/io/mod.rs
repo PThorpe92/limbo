@@ -37,7 +37,7 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 
     /// IO_URING only. noop for other implementations.
-    fn register_buffer(&self, _arena_id: u32, _iovec: (*const u8, usize)) -> Result<()> {
+    fn register_buffer(&self, _arena_id: u32, _iovec: (*const u8, usize)) -> std::io::Result<()> {
         Ok(())
     }
 }
