@@ -461,3 +461,128 @@ fn test_insert_after_big_blob() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[test_log::test]
+#[ignore = "this takes too long :)"]
+fn test_write_delete_with_index() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    maybe_setup_tracing();
+
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE test (x PRIMARY KEY);");
+    let conn = tmp_db.connect_limbo();
+
+    let list_query = "SELECT * FROM test";
+    let max_iterations = 1000;
+    for i in 0..max_iterations {
+        println!("inserting {} ", i);
+        if (i % 100) == 0 {
+            let progress = (i as f64 / max_iterations as f64) * 100.0;
+            println!("progress {:.1}%", progress);
+        }
+        let insert_query = format!("INSERT INTO test VALUES ({})", i);
+        match conn.query(insert_query) {
+            Ok(Some(ref mut rows)) => loop {
+                match rows.step()? {
+                    StepResult::IO => {
+                        tmp_db.io.run_once()?;
+                    }
+                    StepResult::Done => break,
+                    _ => unreachable!(),
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{}", err);
+            }
+        };
+    }
+    for i in 0..max_iterations {
+        println!("deleting {} ", i);
+        if (i % 100) == 0 {
+            let progress = (i as f64 / max_iterations as f64) * 100.0;
+            println!("progress {:.1}%", progress);
+        }
+        let delete_query = format!("delete from test where x={}", i);
+        match conn.query(delete_query) {
+            Ok(Some(ref mut rows)) => loop {
+                match rows.step()? {
+                    StepResult::IO => {
+                        tmp_db.io.run_once()?;
+                    }
+                    StepResult::Done => break,
+                    _ => unreachable!(),
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{}", err);
+            }
+        };
+        println!("listing after deleting {} ", i);
+        let mut current_read_index = i + 1;
+        match conn.query(list_query) {
+            Ok(Some(ref mut rows)) => loop {
+                match rows.step()? {
+                    StepResult::Row => {
+                        let row = rows.row().unwrap();
+                        let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+                        let id = match first_value {
+                            limbo_core::OwnedValue::Integer(i) => *i as i32,
+                            limbo_core::OwnedValue::Float(f) => *f as i32,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(current_read_index, id);
+                        current_read_index += 1;
+                    }
+                    StepResult::IO => {
+                        tmp_db.io.run_once()?;
+                    }
+                    StepResult::Interrupt => break,
+                    StepResult::Done => break,
+                    StepResult::Busy => {
+                        panic!("Database is busy");
+                    }
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{}", err);
+            }
+        }
+        for i in i + 1..max_iterations {
+            // now test with seek
+            match conn.query(format!("select * from test where x = {}", i)) {
+                Ok(Some(ref mut rows)) => loop {
+                    match rows.step()? {
+                        StepResult::Row => {
+                            let row = rows.row().unwrap();
+                            let first_value = row.get::<&OwnedValue>(0).expect("missing id");
+                            let id = match first_value {
+                                limbo_core::OwnedValue::Integer(i) => *i as i32,
+                                limbo_core::OwnedValue::Float(f) => *f as i32,
+                                _ => unreachable!(),
+                            };
+                            assert_eq!(i, id);
+                            break;
+                        }
+                        StepResult::IO => {
+                            tmp_db.io.run_once()?;
+                        }
+                        StepResult::Interrupt => break,
+                        StepResult::Done => break,
+                        StepResult::Busy => {
+                            panic!("Database is busy");
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("{}", err);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}

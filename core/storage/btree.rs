@@ -1031,18 +1031,8 @@ impl BTreeCursor {
             loop {
                 if min > max {
                     if let Some(leftmost_matching_cell) = leftmost_matching_cell {
-                        self.stack.set_cell_index(leftmost_matching_cell as i32);
-                        let matching_cell = contents.cell_get(
-                            leftmost_matching_cell,
-                            payload_overflow_threshold_max(
-                                contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
-                            payload_overflow_threshold_min(
-                                contents.page_type(),
-                                self.usable_space() as u16,
-                            ),
-                            self.usable_space(),
+                        let left_child_page = contents.cell_table_interior_read_left_child_page(
+                            leftmost_matching_cell as usize,
                         )?;
                         // If we found our target rowid in the left subtree,
                         // we need to move the parent cell pointer forwards or backwards depending on the iteration direction.
@@ -1052,19 +1042,15 @@ impl BTreeCursor {
                         // this parent: rowid 666
                         // left child has: 664,665,666
                         // we need to move to the previous parent (with e.g. rowid 663) when iterating backwards.
-                        self.stack.next_cell_in_direction(iter_dir);
-                        let BTreeCell::TableInteriorCell(TableInteriorCell {
-                            _left_child_page,
-                            ..
-                        }) = matching_cell
-                        else {
-                            unreachable!("unexpected cell type: {:?}", matching_cell);
-                        };
-                        let mem_page = self.pager.read_page(_left_child_page as usize)?;
+                        let index_change =
+                            -1 + (iter_dir == IterationDirection::Forwards) as i32 * 2;
+                        self.stack
+                            .set_cell_index(leftmost_matching_cell as i32 + index_change);
+                        let mem_page = self.pager.read_page(left_child_page as usize)?;
                         self.stack.push(mem_page);
                         continue 'outer;
                     }
-                    self.stack.set_cell_index(contents.cell_count() as i32 + 1);
+                    self.stack.set_cell_index(cell_count as i32 + 1);
                     match contents.rightmost_pointer() {
                         Some(right_most_pointer) => {
                             let mem_page = self.pager.read_page(right_most_pointer as usize)?;
@@ -1076,8 +1062,7 @@ impl BTreeCursor {
                         }
                     }
                 }
-                let cur_cell_idx = (min + max) / 2;
-                self.stack.set_cell_index(cur_cell_idx as i32);
+                let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
                 let cell_rowid = contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
                 // in sqlite btrees left child pages have <= keys.
                 // table btrees can have a duplicate rowid in the interior cell, so for example if we are looking for rowid=10,
@@ -1189,7 +1174,7 @@ impl BTreeCursor {
                     continue 'outer;
                 }
 
-                let cur_cell_idx = (min + max) / 2;
+                let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
                 self.stack.set_cell_index(cur_cell_idx as i32);
                 let cell = contents.cell_get(
                     cur_cell_idx as usize,
@@ -1309,7 +1294,6 @@ impl BTreeCursor {
                 let Some(nearest_matching_cell) = nearest_matching_cell else {
                     return Ok(CursorResult::Ok(None));
                 };
-                self.stack.set_cell_index(nearest_matching_cell as i32);
                 let matching_cell = contents.cell_get(
                     nearest_matching_cell,
                     payload_overflow_threshold_max(
@@ -1338,13 +1322,16 @@ impl BTreeCursor {
                     first_overflow_page,
                     payload_size
                 ));
-                self.stack.next_cell_in_direction(iter_dir);
-
+                let cell_idx = if iter_dir == IterationDirection::Forwards {
+                    nearest_matching_cell as i32 + 1
+                } else {
+                    nearest_matching_cell as i32 - 1
+                };
+                self.stack.set_cell_index(cell_idx as i32);
                 return Ok(CursorResult::Ok(Some(cell_rowid)));
             }
 
-            let cur_cell_idx = (min + max) / 2;
-            self.stack.set_cell_index(cur_cell_idx as i32);
+            let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
 
             let cmp = cell_rowid.cmp(&rowid);
@@ -1386,7 +1373,12 @@ impl BTreeCursor {
                     first_overflow_page,
                     payload_size
                 ));
-                self.stack.next_cell_in_direction(iter_dir);
+                let cell_idx = if iter_dir == IterationDirection::Forwards {
+                    cur_cell_idx + 1
+                } else {
+                    cur_cell_idx - 1
+                };
+                self.stack.set_cell_index(cell_idx as i32);
                 return Ok(CursorResult::Ok(Some(cell_rowid)));
             }
 
@@ -1512,7 +1504,7 @@ impl BTreeCursor {
                 return Ok(CursorResult::Ok(Some(rowid)));
             }
 
-            let cur_cell_idx = (min + max) / 2;
+            let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
             self.stack.set_cell_index(cur_cell_idx as i32);
 
             let cell = contents.cell_get(
@@ -5228,8 +5220,10 @@ mod tests {
         fast_lock::SpinLock,
         io::{Buffer, Completion, MemoryIO, OpenFlags, IO},
         storage::{
-            database::DatabaseFile, page_cache::DumbLruPageCache, sqlite3_ondisk,
-            sqlite3_ondisk::DatabaseHeader,
+            database::DatabaseFile,
+            page_cache::DumbLruPageCache,
+            pager::CreateBTreeFlags,
+            sqlite3_ondisk::{self, DatabaseHeader},
         },
         types::Text,
         vdbe::Register,
@@ -5740,6 +5734,81 @@ mod tests {
             }
         }
     }
+
+    fn btree_index_insert_fuzz_run(attempts: usize, inserts: usize) {
+        let (mut rng, seed) = if std::env::var("SEED").is_ok() {
+            let seed = std::env::var("SEED").unwrap();
+            let seed = seed.parse::<u64>().unwrap();
+            let rng = ChaCha8Rng::seed_from_u64(seed);
+            (rng, seed)
+        } else {
+            rng_from_time()
+        };
+        let mut seen = HashSet::new();
+        tracing::info!("super seed: {}", seed);
+        for _ in 0..attempts {
+            let (pager, _) = empty_btree();
+            let index_root_page = pager.btree_create(&CreateBTreeFlags::new_index());
+            let index_root_page = index_root_page as usize;
+            let mut cursor = BTreeCursor::new(None, pager.clone(), index_root_page);
+            let mut keys = Vec::new();
+            tracing::info!("seed: {}", seed);
+            for _ in 0..inserts {
+                let key = {
+                    let result;
+                    loop {
+                        let cols = (0..10)
+                            .map(|_| (rng.next_u64() % (1 << 30)) as i64)
+                            .collect::<Vec<_>>();
+                        if seen.contains(&cols) {
+                            continue;
+                        } else {
+                            seen.insert(cols.clone());
+                        }
+                        result = cols;
+                        break;
+                    }
+                    result
+                };
+                keys.push(key.clone());
+                let value = ImmutableRecord::from_registers(
+                    &key.iter()
+                        .map(|col| Register::OwnedValue(OwnedValue::Integer(*col)))
+                        .collect::<Vec<_>>(),
+                );
+                run_until_done(
+                    || {
+                        cursor.insert(
+                            &BTreeKey::new_index_key(&value),
+                            cursor.is_write_in_progress(),
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap();
+                keys.sort();
+                cursor.move_to_root();
+            }
+            keys.sort();
+            cursor.move_to_root();
+            for key in keys.iter() {
+                tracing::trace!("seeking key: {:?}", key);
+                run_until_done(|| cursor.next(), pager.deref()).unwrap();
+                let record = cursor.record();
+                let record = record.as_ref().unwrap();
+                let cursor_key = record.get_values();
+                assert_eq!(
+                    cursor_key,
+                    &key.iter()
+                        .map(|col| RefValue::Integer(*col))
+                        .collect::<Vec<_>>(),
+                    "key {:?} is not found",
+                    key
+                );
+            }
+        }
+    }
+
     #[test]
     pub fn test_drop_odd() {
         let db = get_database();
@@ -5791,6 +5860,11 @@ mod tests {
             tracing::info!("======= size:{} =======", size);
             btree_insert_fuzz_run(2, 1024, |_| size);
         }
+    }
+
+    #[test]
+    pub fn btree_index_insert_fuzz_run_equal_size() {
+        btree_index_insert_fuzz_run(2, 1024 * 32);
     }
 
     #[test]

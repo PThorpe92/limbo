@@ -589,7 +589,7 @@ impl PageContent {
     /// Read the rowid of a table interior cell.
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> Result<u64> {
-        assert!(self.page_type() == PageType::TableInterior);
+        debug_assert!(self.page_type() == PageType::TableInterior);
         let buf = self.as_ptr();
         const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
         let cell_pointer_array_start = INTERIOR_PAGE_HEADER_SIZE_BYTES;
@@ -600,10 +600,27 @@ impl PageContent {
         Ok(rowid)
     }
 
+    /// Read the left child page of a table interior cell.
+    #[inline(always)]
+    pub fn cell_table_interior_read_left_child_page(&self, idx: usize) -> Result<u32> {
+        debug_assert!(self.page_type() == PageType::TableInterior);
+        let buf = self.as_ptr();
+        const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
+        let cell_pointer_array_start = INTERIOR_PAGE_HEADER_SIZE_BYTES;
+        let cell_pointer = cell_pointer_array_start + (idx * 2);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        Ok(u32::from_be_bytes([
+            buf[cell_pointer],
+            buf[cell_pointer + 1],
+            buf[cell_pointer + 2],
+            buf[cell_pointer + 3],
+        ]))
+    }
+
     /// Read the rowid of a table leaf cell.
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> Result<u64> {
-        assert!(self.page_type() == PageType::TableLeaf);
+        debug_assert!(self.page_type() == PageType::TableLeaf);
         let buf = self.as_ptr();
         const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
         let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;

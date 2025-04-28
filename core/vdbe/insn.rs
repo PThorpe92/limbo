@@ -650,6 +650,12 @@ pub enum Insn {
         cursor_id: CursorID,
     },
 
+    IdxDelete {
+        start_reg: usize,
+        num_regs: usize,
+        cursor_id: CursorID,
+    },
+
     NewRowid {
         cursor: CursorID,        // P1
         rowid_reg: usize,        // P2  Destination register to store the new rowid
@@ -961,6 +967,7 @@ impl Insn {
             Insn::Once { .. } => execute::op_once,
             Insn::NotFound { .. } => execute::op_not_found,
             Insn::Affinity { .. } => execute::op_affinity,
+            Insn::IdxDelete { .. } => execute::op_idx_delete,
         }
     }
 }

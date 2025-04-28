@@ -1037,6 +1037,19 @@ pub fn insn_to_str(
                 0,
                 "".to_string(),
             ),
+            Insn::IdxDelete {
+                cursor_id,
+                start_reg,
+                num_regs,
+            } => (
+                "IdxDelete",
+                *cursor_id as i32,
+                *start_reg as i32,
+                *num_regs as i32,
+                OwnedValue::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::NewRowid {
                 cursor,
                 rowid_reg,

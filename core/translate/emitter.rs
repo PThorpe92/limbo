@@ -2,13 +2,16 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use limbo_sqlite3_parser::ast::{self};
 
 use crate::function::Func;
+use crate::schema::Index;
 use crate::translate::plan::{DeletePlan, Plan, Search};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::ProgramBuilder;
+use crate::vdbe::insn::RegisterOrLiteral;
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::{Result, SymbolTable};
 
@@ -373,7 +376,13 @@ fn emit_program_for_delete(
         &plan.table_references,
         &plan.where_clause,
     )?;
-    emit_delete_insns(program, &mut t_ctx, &plan.table_references, &plan.limit)?;
+    emit_delete_insns(
+        program,
+        &mut t_ctx,
+        &plan.table_references,
+        &plan.indexes,
+        &plan.limit,
+    )?;
 
     // Clean up and close the main execution loop
     close_loop(program, &mut t_ctx, &plan.table_references)?;
@@ -390,6 +399,7 @@ fn emit_delete_insns(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &[TableReference],
+    index_references: &[Arc<Index>],
     limit: &Option<isize>,
 ) -> Result<()> {
     let table_reference = table_references.first().unwrap();
@@ -405,11 +415,12 @@ fn emit_delete_insns(
         },
         _ => return Ok(()),
     };
+    let main_table_cursor_id = program.resolve_cursor_id(table_reference.table.get_name());
 
     // Emit the instructions to delete the row
     let key_reg = program.alloc_register();
     program.emit_insn(Insn::RowId {
-        cursor_id,
+        cursor_id: main_table_cursor_id,
         dest: key_reg,
     });
 
@@ -430,7 +441,43 @@ fn emit_delete_insns(
             conflict_action,
         });
     } else {
-        program.emit_insn(Insn::Delete { cursor_id });
+        for index in index_references {
+            let index_cursor_id = program.alloc_cursor_id(
+                Some(index.name.clone()),
+                crate::vdbe::builder::CursorType::BTreeIndex(index.clone()),
+            );
+
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: index_cursor_id,
+                root_page: RegisterOrLiteral::Literal(index.root_page),
+            });
+            let num_regs = index.columns.len() + 1;
+            let start_reg = program.alloc_registers(num_regs);
+            // Emit columns that are part of the index
+            index
+                .columns
+                .iter()
+                .enumerate()
+                .for_each(|(reg_offset, column_index)| {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: main_table_cursor_id,
+                        column: column_index.pos_in_table,
+                        dest: start_reg + reg_offset,
+                    });
+                });
+            program.emit_insn(Insn::RowId {
+                cursor_id: main_table_cursor_id,
+                dest: start_reg + num_regs - 1,
+            });
+            program.emit_insn(Insn::IdxDelete {
+                start_reg,
+                num_regs,
+                cursor_id: index_cursor_id,
+            });
+        }
+        program.emit_insn(Insn::Delete {
+            cursor_id: main_table_cursor_id,
+        });
     }
     if let Some(limit) = limit {
         let limit_reg = program.alloc_register();

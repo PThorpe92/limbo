@@ -297,6 +297,8 @@ pub struct DeletePlan {
     pub offset: Option<isize>,
     /// query contains a constant condition that is always false
     pub contains_constant_false_condition: bool,
+    /// Indexes that must be updated by the delete operation.
+    pub indexes: Vec<Arc<Index>>,
 }
 
 #[derive(Debug, Clone)]

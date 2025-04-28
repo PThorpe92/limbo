@@ -1402,6 +1402,7 @@ impl SeekOp {
     /// A seek with SeekOp::LE implies:
     /// Find the last table/index key that compares less than or equal to the seek key
     /// -> used in backwards iteration.
+    #[inline(always)]
     pub fn iteration_direction(&self) -> IterationDirection {
         match self {
             SeekOp::EQ | SeekOp::GE | SeekOp::GT => IterationDirection::Forwards,
