@@ -141,14 +141,6 @@ pub enum Buffer {
     Pooled(UnsafeCell<ArenaBuffer>),
 }
 
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        if let Self::Pooled(slice) = self {
-            unsafe { &*slice.get() }.mark_free();
-        }
-    }
-}
-
 impl Buffer {
     pub fn new_heap(len: usize) -> Arc<Self> {
         let out = Pin::new(vec![0u8; len].into_boxed_slice());

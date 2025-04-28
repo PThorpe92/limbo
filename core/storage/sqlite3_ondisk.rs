@@ -768,7 +768,7 @@ fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) -> 
 
 pub fn begin_write_btree_page(
     pager: &Pager,
-    page: &PageRef,
+    page: PageRef,
     write_counter: Rc<RefCell<usize>>,
 ) -> Result<()> {
     trace!("begin_write_btree_page(page={})", page.get().id);
@@ -788,6 +788,7 @@ pub fn begin_write_btree_page(
         let buf_len = buffer.len();
         let buf_ = buffer.clone();
         Completion::new_write(move |bytes_written: i32| {
+            let _page = page.clone();
             let _ = buf_.clone();
             trace!("finish_write_btree_page");
             *write_counter.borrow_mut() -= 1;
@@ -1307,7 +1308,6 @@ fn finish_read_wal_header(buf: Arc<Buffer>, header: Arc<SpinLock<WalHeader>>) ->
 
 pub fn begin_read_wal_frame(
     io: &Arc<dyn File>,
-    frame_size: usize,
     offset: usize,
     buffer_pool: Arc<BufferPool>,
     page: PageRef,
@@ -1317,12 +1317,12 @@ pub fn begin_read_wal_frame(
         offset,
         page.get().id
     );
-    let buf = buffer_pool.get_page(Some(frame_size));
+    let buf = buffer_pool.get_page(None);
     let frame = page.clone();
     let complete = Completion::new_read(buf, move |buf: Arc<Buffer>, res: i32| {
+        let frame_ = frame.clone();
         tracing::trace!("read wal frame({res} bytes)");
-        let frame = frame.clone();
-        finish_read_page(page.get().id, buf.clone(), frame).unwrap();
+        finish_read_page(page.get().id, buf.clone(), frame_).unwrap();
     });
     io.pread(offset, complete)?;
     Ok(())
@@ -1392,6 +1392,7 @@ pub fn begin_write_wal_frame(
     *write_counter.borrow_mut() += 1;
     let buf_copy = buffer.clone();
     let c = Completion::new_write(move |bytes_written: i32| {
+        let page_finish = page_finish.clone();
         let buf_len = buf_copy.len();
         let _ = buf_copy.clone();
         *write_counter.borrow_mut() -= 1;

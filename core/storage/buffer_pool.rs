@@ -75,27 +75,35 @@ impl DerefMut for ArenaBuffer {
     }
 }
 
+impl Drop for ArenaBuffer {
+    fn drop(&mut self) {
+        self.mark_free();
+    }
+}
+
 /// Each arena represents a 2MB anonymous mmap'd memory region that is split into
-/// logical pages and given out to the BufferPool. Each arena is the same fixed size but
-/// is initialized with it's own `page_size`, which determines the length of the free list.
-/// This behavior is mainly to support the WAL requesting buffers
-/// of size: page_size + WAL_FRAME_HEADER_SIZE without having to use an ephemeral heap buffer
-/// and providing a fast path for writing wal frames (which will likely never exceed 1 arena on
-/// their own)
+/// logical pages that are given out to the BufferPool.
 #[derive(Debug)]
 pub struct Arena {
+    /// id of the arena, also used as the index to io_uring registered buffers
     id: u32,
+    /// pointer to the start of the arena
     base: NonNull<u8>,
-    page_size: usize,
-    page_count: u32,
+    /// packed (page_size, page_count)
+    pg_info: u64,
+    /// whether this arena is reistered with io_uring
+    is_registered: Cell<bool>,
+    /// LIFO stack of free slots in the arena
     freelist: FreeStack,
+    /// total number of pages not in the freelist
     in_use: AtomicU32,
-    _parent: Weak<BufferPool>,
+    /// weak reference to the owning buffer pool
+    pool: Weak<BufferPool>,
 }
 
 impl Arena {
     fn new(parent: Arc<BufferPool>, id: u32, page_size: usize) -> Arc<Self> {
-        assert!(page_size <= DEFAULT_ARENA_SIZE);
+        assert!(page_size > 0 && page_size <= DEFAULT_ARENA_SIZE);
         let base = unsafe { arena::alloc(DEFAULT_ARENA_SIZE) };
         let base = NonNull::new(base).unwrap();
         let page_count = (DEFAULT_ARENA_SIZE / page_size) as u32;
@@ -110,20 +118,20 @@ impl Arena {
             id,
             base,
             freelist,
-            page_count,
-            page_size,
+            pg_info: ((page_size as u64) << 32) | (page_count as u64),
+            is_registered: Cell::new(false),
             in_use: AtomicU32::new(0),
-            _parent: Arc::downgrade(&parent),
+            pool: Arc::downgrade(&parent),
         })
     }
 
     pub fn try_alloc(self: &Arc<Self>, len: usize) -> Option<ArenaBuffer> {
-        if len > self.page_size {
+        if len > self.page_size() {
             return None;
         }
         if let Some(slot) = self.freelist.pop() {
             self.in_use.fetch_add(1, Ordering::Relaxed);
-            let addr = unsafe { self.base.as_ptr().add(slot as usize * self.page_size) };
+            let addr = unsafe { self.base.as_ptr().add(slot as usize * self.page_size()) };
             return Some(ArenaBuffer::new(
                 NonNull::new(addr).unwrap(),
                 len,
@@ -136,14 +144,23 @@ impl Arena {
 
     pub fn mark_free(&self, id: u32) {
         let split = split_id(id);
-        assert!(self.id == split.0 && self.page_count > split.1);
+        assert!(self.id == split.0 && self.page_count() > split.1);
         tracing::trace!("arena({}: mark_free({}))", self.id, split.1);
         self.freelist.push(split.1);
-        if self.in_use.fetch_sub(1, Ordering::Relaxed) == 1 && self.id > 2 {
+        if self.in_use.fetch_sub(1, Ordering::Relaxed) == 1 && !self.is_registered.get() {
             // this arena was allocated in an overflow, so we can drop the arena to shrink the pool
-            let pool = self._parent.upgrade().expect("BufferPool dropped");
+            let pool = self.pool.upgrade().expect("BufferPool dropped");
             pool.try_reclaim(self.id);
         }
+    }
+    #[inline]
+    fn page_size(&self) -> usize {
+        (self.pg_info >> 32) as usize
+    }
+
+    #[inline]
+    fn page_count(&self) -> u32 {
+        (self.pg_info & 0xFFFF_FFFF) as u32
     }
 }
 
@@ -327,6 +344,8 @@ impl BufferPool {
                 // buffers, io_uring logs which id's are fixed. we set the flag unconditionally here
                 // because even if the error wasn't ENOMEM, we don't want to make the call again
                 self.rlimit_hit.set(true);
+            } else {
+                arena.is_registered.set(true);
             }
         }
         // hand out one page from the new arena
@@ -345,7 +364,9 @@ impl BufferPool {
             return;
         }
         if let Some(pos) = arenas.iter().position(|a| a.id == id) {
-            if arenas[pos].in_use.load(Ordering::Acquire) == 0 {
+            let arena = &arenas[pos];
+            assert!(!arena.is_registered.get());
+            if arena.in_use.load(Ordering::Acquire) == 0 {
                 tracing::debug!("reclaiming overflow arena({})", id);
                 // drop the arc, unmaps memory in Arena::drop.
                 arenas.remove(pos);

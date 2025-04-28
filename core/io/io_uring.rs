@@ -53,7 +53,7 @@ struct InnerUringIO {
     ring: WrappedIOUring,
     files: AtomicU32,
     buffer_offset: AtomicU32,
-    // io_id's of buffers we can use fixed opcodes for
+    // arena_id's of buffers we can use fixed opcodes for
     registered_buffers: u64,
 }
 

@@ -429,12 +429,10 @@ impl Wal for WalFile {
         page.set_locked();
         begin_read_wal_frame(
             &self.get_shared().file,
-            self.page_size,
             offset + WAL_FRAME_HEADER_SIZE,
             buffer_pool,
             page,
-        )?;
-        Ok(())
+        )
     }
 
     /// Write a frame to the WAL.
@@ -447,7 +445,7 @@ impl Wal for WalFile {
         let page_id = page.get().id;
         let shared = self.get_shared();
         let max_frame = shared.max_frame.load(Ordering::SeqCst);
-        let frame_id = if max_frame == 0 { 1 } else { max_frame + 1 };
+        let frame_id = max_frame + 1;
         let offset = self.frame_offset(frame_id);
         tracing::debug!(
             "append_frame(frame={}, offset={}, page_id={})",
@@ -590,7 +588,7 @@ impl Wal for WalFile {
                     self.ongoing_checkpoint.page.set_dirty();
                     begin_write_btree_page(
                         pager,
-                        &self.ongoing_checkpoint.page,
+                        self.ongoing_checkpoint.page.clone(),
                         write_counter.clone(),
                     )?;
                     self.ongoing_checkpoint.state = CheckpointState::WaitWritePage;
@@ -698,7 +696,7 @@ impl WalFile {
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
-        let buffer = buffer_pool.get_page(Some(page_size + WAL_FRAME_HEADER_SIZE));
+        let buffer = buffer_pool.get_page(None);
         let buffer_pool = buffer_pool.clone();
         checkpoint_page.get().contents = Some(PageContent::new(0, buffer));
         Self {
