@@ -255,7 +255,7 @@ pub fn begin_read_database_header(
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(DatabaseHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, _: i32| {
         let header = header.clone();
         finish_read_database_header(buf, header).unwrap();
     });
@@ -309,7 +309,7 @@ pub fn begin_write_database_header(header: &DatabaseHeader, pager: &Pager) -> Re
     let buffer_to_copy = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let buffer_to_copy_in_cb = buffer_to_copy.clone();
 
-    let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>| {
+    let read_complete = Box::new(move |buffer: Arc<RefCell<Buffer>>, _: i32| {
         let buffer = buffer.borrow().clone();
         let buffer = Rc::new(RefCell::new(buffer));
         let mut buf_mut = buffer.borrow_mut();
@@ -779,7 +779,8 @@ pub fn begin_read_page(
     });
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, res: i32| {
+        trace!("finish_read_btree_page(res = {})", res);
         let page = page.clone();
         if finish_read_page(page_idx, buf, page.clone()).is_err() {
             page.set_error();
@@ -1330,7 +1331,8 @@ pub fn begin_read_wal_header(io: &Arc<dyn File>) -> Result<Arc<SpinLock<WalHeade
     let buf = Arc::new(RefCell::new(Buffer::allocate(512, drop_fn)));
     let result = Arc::new(SpinLock::new(WalHeader::default()));
     let header = result.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, res: i32| {
+        trace!("read_wal_header(res = {})", res);
         let header = header.clone();
         finish_read_wal_header(buf, header).unwrap();
     });
@@ -1376,7 +1378,8 @@ pub fn begin_read_wal_frame(
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(RefCell::new(Buffer::new(buf, drop_fn)));
     let frame = page.clone();
-    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>| {
+    let complete = Box::new(move |buf: Arc<RefCell<Buffer>>, res: i32| {
+        trace!("read wal frame(res = {})", res);
         let frame = frame.clone();
         finish_read_page(page.get().id, buf, frame).unwrap();
     });

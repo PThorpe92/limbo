@@ -3,6 +3,7 @@ use crate::io::common;
 use crate::Result;
 
 use super::{Completion, File, MemoryIO, OpenFlags, IO};
+use crate::io::clock::{Clock, Instant};
 use polling::{Event, Events, Poller};
 use rustix::{
     fd::{AsFd, AsRawFd},
@@ -18,7 +19,6 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, trace};
-use crate::io::clock::{Clock, Instant};
 
 struct OwnedCallbacks(UnsafeCell<Callbacks>);
 // We assume we locking on IO level is done by user.
@@ -243,7 +243,7 @@ impl IO for UnixIO {
                 };
                 match result {
                     Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
+                        CompletionCallback::Read(_, ref c, _) => c.complete(n as i32),
                         CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
                     },
                     Err(e) => return Err(e.into()),
@@ -258,7 +258,7 @@ impl IO for UnixIO {
         getrandom::getrandom(&mut buf).unwrap();
         i64::from_ne_bytes(buf)
     }
-    
+
     fn get_memory_io(&self) -> Arc<MemoryIO> {
         Arc::new(MemoryIO::new())
     }
@@ -334,7 +334,7 @@ impl File for UnixFile<'_> {
             Ok(n) => {
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
-                c.complete(0);
+                c.complete(n as i32);
                 Ok(())
             }
             Err(Errno::AGAIN) => {

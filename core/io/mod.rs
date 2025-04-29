@@ -44,7 +44,7 @@ pub trait IO: Clock + Send + Sync {
     fn get_memory_io(&self) -> Arc<MemoryIO>;
 }
 
-pub type Complete = dyn Fn(Arc<RefCell<Buffer>>);
+pub type Complete = dyn Fn(Arc<RefCell<Buffer>>, i32);
 pub type WriteComplete = dyn Fn(i32);
 pub type SyncComplete = dyn Fn(i32);
 
@@ -62,7 +62,7 @@ pub struct ReadCompletion {
 impl Completion {
     pub fn complete(&self, result: i32) {
         match self {
-            Self::Read(r) => r.complete(),
+            Self::Read(r) => r.complete(result),
             Self::Write(w) => w.complete(result),
             Self::Sync(s) => s.complete(result), // fix
         }
@@ -99,8 +99,8 @@ impl ReadCompletion {
         self.buf.borrow_mut()
     }
 
-    pub fn complete(&self) {
-        (self.complete)(self.buf.clone());
+    pub fn complete(&self, res: i32) {
+        (self.complete)(self.buf.clone(), res);
     }
 }
 
