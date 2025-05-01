@@ -29,7 +29,7 @@ def bench_one(vfs: str, sql: str, iterations: int) -> list[float]:
     """
     shell = TestLimboShell(
         exec_name=str(LIMBO_BIN),
-        flags=f"-q -m list --vfs {vfs} {DB_FILE}",
+        flags=f"-q -t testing/trace.log -m list --vfs {vfs} {DB_FILE}",
         init_commands="",
     )
 
@@ -47,6 +47,7 @@ def bench_one(vfs: str, sql: str, iterations: int) -> list[float]:
 
 
 def setup_temp_db() -> None:
+    cleanup_temp_db()
     cmd = ["sqlite3", "testing/testing.db", ".clone testing/temp.db"]
     proc = subprocess.run(cmd, check=True)
     proc.check_returncode()
@@ -66,7 +67,6 @@ def main() -> None:
     parser.add_argument("sql", help="SQL statement to execute (quote it)")
     parser.add_argument("iterations", type=int, help="number of repetitions")
     args = parser.parse_args()
-    setup_temp_db()
 
     sql, iterations = args.sql, args.iterations
     if iterations <= 0:
@@ -80,6 +80,7 @@ def main() -> None:
     averages: Dict[str, float] = {}
 
     for vfs in vfs_list:
+        setup_temp_db()
         test(f"\n### VFS: {vfs} ###")
         times = bench_one(vfs, sql, iterations)
         info(f"All times ({vfs}):", " ".join(f"{t:.6f}" for t in times))
