@@ -7,13 +7,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 
 use crate::fast_lock::SpinLock;
-use crate::io::{File, SyncCompletion, IO};
+use crate::io::{File, IO};
 use crate::result::LimboResult;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_write_wal_frame, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
 };
-use crate::{Buffer, LimboError, Result};
 use crate::{Completion, Page};
+use crate::{LimboError, Result};
 
 use self::sqlite3_ondisk::{checksum_wal, PageContent, WAL_MAGIC_BE, WAL_MAGIC_LE};
 
@@ -165,7 +165,7 @@ pub trait Wal {
     fn find_frame(&self, page_id: u64) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()>;
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()>;
 
     /// Write a frame to the WAL.
     fn append_frame(
@@ -242,7 +242,7 @@ impl fmt::Debug for OngoingCheckpoint {
 #[allow(dead_code)]
 pub struct WalFile {
     io: Arc<dyn IO>,
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
 
     sync_state: RefCell<SyncState>,
     syncing: Rc<RefCell<bool>>,
@@ -424,7 +424,7 @@ impl Wal for WalFile {
     }
 
     /// Read a frame from the WAL.
-    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Rc<BufferPool>) -> Result<()> {
+    fn read_frame(&self, frame_id: u64, page: PageRef, buffer_pool: Arc<BufferPool>) -> Result<()> {
         debug!("read_frame({})", frame_id);
         let offset = self.frame_offset(frame_id);
         page.set_locked();
@@ -459,6 +459,7 @@ impl Wal for WalFile {
         let header = header.lock();
         let checksums = shared.last_checksum;
         let checksums = begin_write_wal_frame(
+            self.buffer_pool.clone(),
             &shared.file,
             offset,
             &page,
@@ -646,11 +647,9 @@ impl Wal for WalFile {
                 {
                     let syncing = self.syncing.clone();
                     *syncing.borrow_mut() = true;
-                    let completion = Completion::Sync(SyncCompletion {
-                        complete: Box::new(move |_| {
-                            debug!("wal_sync finish");
-                            *syncing.borrow_mut() = false;
-                        }),
+                    let completion = Completion::new_sync(move |_| {
+                        debug!("wal_sync finish");
+                        *syncing.borrow_mut() = false;
                     });
                     shared.file.sync(completion)?;
                 }
@@ -690,19 +689,12 @@ impl WalFile {
         io: Arc<dyn IO>,
         page_size: u32,
         shared: Arc<UnsafeCell<WalFileShared>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let checkpoint_page = Arc::new(Page::new(0));
-        let buffer = buffer_pool.get();
+        let buffer = buffer_pool.get_page(Some(page_size as usize));
         {
-            let buffer_pool = buffer_pool.clone();
-            let drop_fn = Rc::new(move |buf| {
-                buffer_pool.put(buf);
-            });
-            checkpoint_page.get().contents = Some(PageContent::new(
-                0,
-                Arc::new(RefCell::new(Buffer::new(buffer, drop_fn))),
-            ));
+            checkpoint_page.get().contents = Some(PageContent::new(0, buffer));
         }
         Self {
             io,

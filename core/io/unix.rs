@@ -233,20 +233,19 @@ impl IO for UnixIO {
                     CompletionCallback::Read(ref file, ref c, pos) => {
                         let mut file = file.borrow_mut();
                         let r = c.as_read();
-                        let mut buf = r.buf_mut();
+                        let buf = r.buf_mut();
                         file.seek(std::io::SeekFrom::Start(pos as u64))?;
-                        file.read(buf.as_mut_slice())
+                        file.read(buf)
                     }
                     CompletionCallback::Write(ref file, _, ref buf, pos) => {
                         let mut file = file.borrow_mut();
-                        let buf = buf.borrow();
                         file.seek(std::io::SeekFrom::Start(pos as u64))?;
                         file.write(buf.as_slice())
                     }
                 };
                 match result {
                     Ok(n) => match &cf {
-                        CompletionCallback::Read(_, ref c, _) => c.complete(0),
+                        CompletionCallback::Read(_, ref c, _) => c.complete(n as i32),
                         CompletionCallback::Write(_, ref c, _, _) => c.complete(n as i32),
                     },
                     Err(e) => return Err(e.into()),
@@ -272,7 +271,7 @@ enum CompletionCallback {
     Write(
         Arc<RefCell<std::fs::File>>,
         Completion,
-        Arc<RefCell<crate::Buffer>>,
+        Arc<crate::Buffer>,
         usize,
     ),
 }
@@ -330,14 +329,14 @@ impl File for UnixFile<'_> {
         let file = self.file.borrow();
         let result = {
             let r = c.as_read();
-            let mut buf = r.buf_mut();
-            rustix::io::pread(file.as_fd(), buf.as_mut_slice(), pos as u64)
+            let buf = r.buf_mut();
+            rustix::io::pread(file.as_fd(), buf, pos as u64)
         };
         match result {
             Ok(n) => {
                 trace!("pread n: {}", n);
                 // Read succeeded immediately
-                c.complete(0);
+                c.complete(n as i32);
                 Ok(())
             }
             Err(Errno::AGAIN) => {
@@ -358,11 +357,11 @@ impl File for UnixFile<'_> {
         }
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
+    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
         let file = self.file.borrow();
         let result = {
-            let buf = buffer.borrow();
-            rustix::io::pwrite(file.as_fd(), buf.as_slice(), pos as u64)
+            let buf = buffer.as_slice();
+            rustix::io::pwrite(file.as_fd(), buf, pos as u64)
         };
         match result {
             Ok(n) => {

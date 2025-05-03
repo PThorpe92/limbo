@@ -47,17 +47,17 @@ use parking_lot::RwLock;
 use schema::{Column, Schema};
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, OnceCell, RefCell, UnsafeCell},
     collections::HashMap,
     io::Write,
     num::NonZero,
     ops::Deref,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
-use storage::btree::btree_init_page;
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
+use storage::{btree::btree_init_page, sqlite3_ondisk::PageContent};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -67,7 +67,6 @@ pub use storage::{
 };
 use storage::{
     page_cache::DumbLruPageCache,
-    pager::allocate_page,
     sqlite3_ondisk::{DatabaseHeader, DATABASE_HEADER_SIZE},
 };
 use translate::select::prepare_select_plan;
@@ -84,6 +83,8 @@ enum TransactionState {
     Read,
     None,
 }
+
+static GLOBAL_BUFFER_POOL: OnceLock<Arc<BufferPool>> = OnceLock::new();
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
 
@@ -102,6 +103,7 @@ pub struct Database {
     shared_page_cache: Arc<RwLock<DumbLruPageCache>>,
     shared_wal: Arc<UnsafeCell<WalFileShared>>,
     open_flags: OpenFlags,
+    buffer_pool: Arc<BufferPool>,
 }
 
 unsafe impl Send for Database {}
@@ -149,6 +151,7 @@ impl Database {
         io.run_once()?;
 
         let page_size = db_header.lock().get_page_size();
+        let pool = BufferPool::new_global(page_size as usize, io.clone());
         let wal_path = format!("{}-wal", path);
         let shared_wal = WalFileShared::open_shared(&io, wal_path.as_str(), page_size)?;
 
@@ -178,6 +181,7 @@ impl Database {
             io: io.clone(),
             page_size,
             open_flags: flags,
+            buffer_pool: pool,
         };
         let db = Arc::new(db);
         {
@@ -200,13 +204,11 @@ impl Database {
     }
 
     pub fn connect(self: &Arc<Database>) -> Result<Rc<Connection>> {
-        let buffer_pool = Rc::new(BufferPool::new(self.page_size as usize));
-
         let wal = Rc::new(RefCell::new(WalFile::new(
             self.io.clone(),
             self.page_size,
             self.shared_wal.clone(),
-            buffer_pool.clone(),
+            self.buffer_pool.clone(),
         )));
         let pager = Rc::new(Pager::finish_open(
             self.header.clone(),
@@ -214,7 +216,7 @@ impl Database {
             Some(wal),
             self.io.clone(),
             self.shared_page_cache.clone(),
-            buffer_pool,
+            self.buffer_pool.clone(),
         )?);
         let conn = Rc::new(Connection {
             _db: self.clone(),
@@ -265,11 +267,13 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
     if file.size()? == 0 {
         // init db
         let db_header = DatabaseHeader::default();
-        let page1 = allocate_page(
-            1,
-            &Rc::new(BufferPool::new(db_header.get_page_size() as usize)),
-            DATABASE_HEADER_SIZE,
-        );
+        #[allow(clippy::arc_with_non_send_sync)]
+        let page1 = Arc::new(Page::new(1));
+        {
+            let buffer = Buffer::new_heap(4096);
+            page1.set_loaded();
+            page1.get().contents = Some(PageContent::new(DATABASE_HEADER_SIZE, buffer));
+        }
         {
             // Create the sqlite_schema table, for this we just need to create the btree page
             // for the first page of the database which is basically like any other btree page
@@ -288,9 +292,9 @@ pub fn maybe_init_database_file(file: &Arc<dyn File>, io: &Arc<dyn IO>) -> Resul
             let flag_complete = Rc::new(RefCell::new(false));
             {
                 let flag_complete = flag_complete.clone();
-                let completion = Completion::Write(WriteCompletion::new(Box::new(move |_| {
+                let completion = Completion::new_write(move |_| {
                     *flag_complete.borrow_mut() = true;
-                })));
+                });
                 file.pwrite(0, contents.buffer.clone(), completion)?;
             }
             let mut limit = 100;

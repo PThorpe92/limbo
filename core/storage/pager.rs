@@ -4,7 +4,7 @@ use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::DatabaseStorage;
 use crate::storage::sqlite3_ondisk::{self, DatabaseHeader, PageContent, PageType};
 use crate::storage::wal::{CheckpointResult, Wal};
-use crate::{Buffer, LimboError, Result};
+use crate::{LimboError, Result};
 use parking_lot::RwLock;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
@@ -22,6 +22,8 @@ pub struct PageInner {
     pub id: usize,
 }
 
+// Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
+// because that is bad bad.
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
 }
@@ -168,7 +170,7 @@ pub struct Pager {
     /// A page cache for the database.
     page_cache: Arc<RwLock<DumbLruPageCache>>,
     /// Buffer pool for temporary data storage.
-    buffer_pool: Rc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
     dirty_pages: Rc<RefCell<HashSet<usize>>>,
@@ -193,7 +195,7 @@ impl Pager {
         wal: Option<Rc<RefCell<dyn Wal>>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<DumbLruPageCache>>,
-        buffer_pool: Rc<BufferPool>,
+        buffer_pool: Arc<BufferPool>,
     ) -> Result<Self> {
         Ok(Self {
             db_file,
@@ -689,15 +691,10 @@ impl Pager {
     }
 }
 
-pub fn allocate_page(page_id: usize, buffer_pool: &Rc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_page(page_id: usize, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
-        let buffer = buffer_pool.get();
-        let bp = buffer_pool.clone();
-        let drop_fn = Rc::new(move |buf| {
-            bp.put(buf);
-        });
-        let buffer = Arc::new(RefCell::new(Buffer::new(buffer, drop_fn)));
+        let buffer = buffer_pool.get_page(None);
         page.set_loaded();
         page.get().contents = Some(PageContent::new(offset, buffer));
     }
