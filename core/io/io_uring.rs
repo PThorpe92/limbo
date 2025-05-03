@@ -1,20 +1,26 @@
-use super::{common, Completion, File, OpenFlags, WriteCompletion, IO};
-use crate::io::clock::{Clock, Instant};
-use crate::{LimboError, MemoryIO, Result};
+use super::{common, Completion, File, OpenFlags, IO};
+use crate::{
+    fast_lock::SpinLock,
+    io::clock::{Clock, Instant},
+    LimboError, MemoryIO, Result,
+};
 use rustix::fs::{self, FlockOperation, OFlags};
-use rustix::io_uring::iovec;
-use std::cell::RefCell;
-use std::fmt;
-use std::io::ErrorKind;
-use std::os::fd::AsFd;
-use std::os::unix::io::AsRawFd;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{
+    fmt,
+    io::ErrorKind,
+    mem::MaybeUninit,
+    os::{fd::AsFd, unix::io::AsRawFd},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
+};
 use thiserror::Error;
 use tracing::{debug, trace};
 
-const MAX_IOVECS: u32 = 128;
+const ENTRIES: u32 = 1024;
 const SQPOLL_IDLE: u32 = 1000;
+const ACTIVE_FILES: usize = 2;
 
 #[derive(Debug, Error)]
 enum UringIOError {
@@ -34,7 +40,7 @@ impl fmt::Display for UringIOError {
 }
 
 pub struct UringIO {
-    inner: Rc<RefCell<InnerUringIO>>,
+    inner: Arc<SpinLock<InnerUringIO>>,
 }
 
 unsafe impl Send for UringIO {}
@@ -43,59 +49,85 @@ unsafe impl Sync for UringIO {}
 struct WrappedIOUring {
     ring: io_uring::IoUring,
     pending_ops: usize,
-    pub pending: [Option<Completion>; MAX_IOVECS as usize + 1],
+    pub pending: [MaybeUninit<(u64, Completion)>; ENTRIES as usize + 1],
     key: u64,
 }
 
 struct InnerUringIO {
     ring: WrappedIOUring,
-    iovecs: [iovec; MAX_IOVECS as usize],
-    next_iovec: usize,
+    files: AtomicU32,
+    registered_arena: AtomicBool,
 }
 
 impl UringIO {
     pub fn new() -> Result<Self> {
         let ring = match io_uring::IoUring::builder()
             .setup_sqpoll(SQPOLL_IDLE)
-            .build(MAX_IOVECS)
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .build(ENTRIES)
         {
             Ok(ring) => ring,
-            Err(_) => io_uring::IoUring::new(MAX_IOVECS)?,
+            Err(_) => io_uring::IoUring::new(ENTRIES)?,
         };
+        let sub = ring.submitter();
+        sub.register_buffers_sparse(1)?; // one buffer for the bufferpool arena
+        sub.register_files_sparse(ACTIVE_FILES as u32)?; // db and wal files
         let inner = InnerUringIO {
             ring: WrappedIOUring {
                 ring,
                 pending_ops: 0,
-                pending: [const { None }; MAX_IOVECS as usize + 1],
+                pending: [const { MaybeUninit::uninit() }; ENTRIES as usize + 1],
                 key: 0,
             },
-            iovecs: [iovec {
-                iov_base: std::ptr::null_mut(),
-                iov_len: 0,
-            }; MAX_IOVECS as usize],
-            next_iovec: 0,
+            files: 0u32.into(),
+            registered_arena: false.into(),
         };
         debug!("Using IO backend 'io-uring'");
+        #[allow(clippy::arc_with_non_send_sync)]
         Ok(Self {
-            inner: Rc::new(RefCell::new(inner)),
+            inner: Arc::new(SpinLock::new(inner)),
         })
     }
-}
 
-impl InnerUringIO {
-    pub fn get_iovec(&mut self, buf: *const u8, len: usize) -> &iovec {
-        let iovec = &mut self.iovecs[self.next_iovec];
-        iovec.iov_base = buf as *mut std::ffi::c_void;
-        iovec.iov_len = len;
-        self.next_iovec = (self.next_iovec + 1) % MAX_IOVECS as usize;
-        iovec
+    /// Register file descriptor with io_uring to allow for Fixed opcodes.
+    fn register_file(&self, fd: i32) -> Result<u32> {
+        let inner = &mut *self.inner.lock();
+        let mut fd_idx = inner
+            .files
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if inner.files.load(Ordering::Relaxed) > ACTIVE_FILES as u32 {
+            // TODO: when we support multiple databases, this will likely need to change.
+            // each Database will register at most 2 files (db + WAL)
+            // so this means we need to replace the oldest file and start over
+            // io_uring will allow overwriting the fd index so we can just set back to 0.
+            // If < 2 files are being used, we are always just using the next available slot.
+            fd_idx = 0;
+        }
+        inner
+            .ring
+            .ring
+            .submitter()
+            .register_files_update(fd_idx, &[fd])?;
+        trace!("io_uring(registered file: {fd})");
+        Ok(fd_idx)
     }
 }
 
+fn idx_from_key(key: u64) -> usize {
+    (key & (ENTRIES - 1) as u64) as usize
+}
+
+const GEN_SHIFT: u64 = 32;
 impl WrappedIOUring {
     fn submit_entry(&mut self, entry: &io_uring::squeue::Entry, c: Completion) {
         trace!("submit_entry({:?})", entry);
-        self.pending[entry.get_user_data() as usize] = Some(c);
+        let usr_data = entry.get_user_data();
+        let idx = idx_from_key(usr_data);
+        self.pending[idx].write((usr_data >> GEN_SHIFT, c));
+        if self.ring.submission().is_full() {
+            self.wait_for_completion().unwrap();
+        }
         unsafe {
             self.ring
                 .submission()
@@ -103,13 +135,16 @@ impl WrappedIOUring {
                 .expect("submission queue is full");
         }
         self.pending_ops += 1;
+        assert!(self.pending_ops <= ENTRIES as usize);
     }
 
+    #[inline(always)]
     fn wait_for_completion(&mut self) -> Result<()> {
         self.ring.submit_and_wait(1)?;
         Ok(())
     }
 
+    #[inline(always)]
     fn get_completion(&mut self) -> Option<io_uring::cqueue::Entry> {
         // NOTE: This works because CompletionQueue's next function pops the head of the queue. This is not normal behaviour of iterators
         let entry = self.ring.completion().next();
@@ -121,17 +156,16 @@ impl WrappedIOUring {
         entry
     }
 
+    #[inline(always)]
     fn empty(&self) -> bool {
         self.pending_ops == 0
     }
 
+    #[inline(always)]
     fn get_key(&mut self) -> u64 {
-        self.key += 1;
-        if self.key == MAX_IOVECS as u64 {
-            let key = self.key;
-            self.key = 0;
-            return key;
-        }
+        let slot = (self.key & ((ENTRIES - 1) as u64)) + 1; // round‑robin slot
+        let gen = (self.key >> GEN_SHIFT) + 1;
+        self.key = (gen << GEN_SHIFT) | slot;
         self.key
     }
 }
@@ -157,9 +191,11 @@ impl IO for UringIO {
                 Err(error) => debug!("Error {error:?} returned when setting O_DIRECT flag to read file. The performance of the system may be affected"),
             }
         }
+        let id = self.register_file(file.as_raw_fd())?;
         let uring_file = Arc::new(UringFile {
             io: self.inner.clone(),
             file,
+            id,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
             uring_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
@@ -169,9 +205,8 @@ impl IO for UringIO {
 
     fn run_once(&self) -> Result<()> {
         trace!("run_once()");
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock();
         let ring = &mut inner.ring;
-
         if ring.empty() {
             return Ok(());
         }
@@ -186,13 +221,37 @@ impl IO for UringIO {
                     cqe
                 )));
             }
-            {
-                if let Some(c) = ring.pending[cqe.user_data() as usize].as_ref() {
-                    c.complete(cqe.result());
-                }
+            let user_data = cqe.user_data();
+            let idx = idx_from_key(user_data);
+            // ensure the completion is for the current request and we didnt wrap
+            let (gen, comp) = unsafe { ring.pending[idx].assume_init_read() };
+            if gen == (user_data >> GEN_SHIFT) {
+                comp.complete(result);
+                ring.pending[idx] = MaybeUninit::uninit();
+            } else {
+                return Err(LimboError::UringIOError(format!(
+                    "Invalid completion: {cqe:?}, expected {gen} but got {}",
+                    user_data >> GEN_SHIFT
+                )));
             }
-            ring.pending[cqe.user_data() as usize] = None;
         }
+        Ok(())
+    }
+
+    fn register_arena(&self, iovec: (*mut u8, usize)) -> std::io::Result<()> {
+        let inner = self.inner.lock();
+        unsafe {
+            inner.ring.ring.submitter().register_buffers_update(
+                0,
+                &[libc::iovec {
+                    iov_base: iovec.0 as _,
+                    iov_len: iovec.1,
+                }],
+                None,
+            )
+        }?;
+
+        inner.registered_arena.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -218,8 +277,9 @@ impl Clock for UringIO {
 }
 
 pub struct UringFile {
-    io: Rc<RefCell<InnerUringIO>>,
+    io: Arc<SpinLock<InnerUringIO>>,
     file: std::fs::File,
+    id: u32,
 }
 
 unsafe impl Send for UringFile {}
@@ -265,49 +325,66 @@ impl File for UringFile {
 
     fn pread(&self, pos: usize, c: Completion) -> Result<()> {
         let r = c.as_read();
-        trace!("pread(pos = {}, length = {})", pos, r.buf().len());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
-        let mut io = self.io.borrow_mut();
+        let io = &mut *self.io.lock();
         let read_e = {
-            let mut buf = r.buf_mut();
-            let len = buf.len();
-            let buf = buf.as_mut_ptr();
-            let iovec = io.get_iovec(buf, len);
-            io_uring::opcode::Readv::new(fd, iovec as *const iovec as *const libc::iovec, 1)
+            let len = r.buf.len();
+            let ptr = r.buf.as_ptr() as *mut u8;
+            assert!(!ptr.is_null());
+            if r.buf.is_fixed() && io.registered_arena.load(Ordering::Relaxed) {
+                trace!("pread_fixed(pos = {}, length = {})", pos, r.buf.len());
+                io_uring::opcode::ReadFixed::new(
+                    io_uring::types::Fixed(self.id),
+                    ptr,
+                    len as u32,
+                    0,
+                )
                 .offset(pos as u64)
                 .build()
                 .user_data(io.ring.get_key())
+            } else {
+                trace!("pread(pos = {}, length = {})", pos, r.buf.len());
+                io_uring::opcode::Read::new(fd, ptr, len as u32)
+                    .offset(pos as u64)
+                    .build()
+                    .user_data(io.ring.get_key())
+            }
         };
         io.ring.submit_entry(&read_e, c);
         Ok(())
     }
 
-    fn pwrite(&self, pos: usize, buffer: Arc<RefCell<crate::Buffer>>, c: Completion) -> Result<()> {
-        let mut io = self.io.borrow_mut();
+    fn pwrite(&self, pos: usize, buffer: Arc<crate::Buffer>, c: Completion) -> Result<()> {
+        assert!(!buffer.as_ptr().is_null());
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
+        let io = &mut *self.io.lock();
         let write = {
-            let buf = buffer.borrow();
-            trace!("pwrite(pos = {}, length = {})", pos, buf.len());
-            let iovec = io.get_iovec(buf.as_ptr(), buf.len());
-            io_uring::opcode::Writev::new(fd, iovec as *const iovec as *const libc::iovec, 1)
+            if io.registered_arena.load(Ordering::Relaxed) && buffer.is_fixed() {
+                trace!("pwrite_fixed(pos = {}, length = {})", pos, buffer.len());
+                io_uring::opcode::WriteFixed::new(
+                    io_uring::types::Fixed(self.id),
+                    buffer.as_ptr(),
+                    buffer.len() as u32,
+                    0,
+                )
                 .offset(pos as u64)
                 .build()
                 .user_data(io.ring.get_key())
+            } else {
+                trace!("pwrite(pos = {}, length = {})", pos, buffer.len());
+                io_uring::opcode::Write::new(fd, buffer.as_ptr(), buffer.len() as u32)
+                    .offset(pos as u64)
+                    .build()
+                    .user_data(io.ring.get_key())
+            }
         };
-        io.ring.submit_entry(
-            &write,
-            Completion::Write(WriteCompletion::new(Box::new(move |result| {
-                c.complete(result);
-                // NOTE: Explicitly reference buffer to ensure it lives until here
-                let _ = buffer.borrow();
-            }))),
-        );
+        io.ring.submit_entry(&write, c);
         Ok(())
     }
 
     fn sync(&self, c: Completion) -> Result<()> {
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
-        let mut io = self.io.borrow_mut();
+        let io = &mut *self.io.lock();
         trace!("sync()");
         let sync = io_uring::opcode::Fsync::new(fd)
             .build()

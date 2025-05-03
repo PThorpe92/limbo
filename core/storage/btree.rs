@@ -987,6 +987,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the rightmost record in the btree.
     fn move_to_rightmost(&mut self) -> Result<CursorResult<()>> {
+        tracing::trace!("move to rightmost");
         self.move_to_root();
 
         loop {
@@ -999,6 +1000,7 @@ impl BTreeCursor {
                 if contents.cell_count() > 0 {
                     self.stack.set_cell_index(contents.cell_count() as i32 - 1);
                 }
+                tracing::trace!("move to rightmost: end. position: {}", self.stack.current());
                 return Ok(CursorResult::Ok(()));
             }
 
@@ -2727,7 +2729,7 @@ impl BTreeCursor {
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
         i: usize,
-        page: &std::sync::Arc<crate::Page>,
+        page: &PageRef,
     ) {
         let left_pointer = if parent_contents.overflow_cells.len() == 0 {
             let (cell_start, cell_len) = parent_contents.cell_get_raw_region(
@@ -2774,7 +2776,7 @@ impl BTreeCursor {
         parent_page: &PageRef,
         balance_info: &mut BalanceInfo,
         parent_contents: &mut PageContent,
-        pages_to_balance_new: [Option<std::sync::Arc<crate::Page>>; 5],
+        pages_to_balance_new: [Option<PageRef>; 5],
         page_type: PageType,
         leaf_data: bool,
         mut cells_debug: Vec<Vec<u8>>,
@@ -3308,6 +3310,7 @@ impl BTreeCursor {
 
         root_contents.write_u8(offset::BTREE_FRAGMENTED_BYTES_COUNT, 0);
         root_contents.overflow_cells.clear();
+        debug_validate_cells!(root_contents, self.usable_space() as u16);
         self.root_page = root.get().id;
         self.stack.clear();
         self.stack.push(root.clone());
@@ -3565,11 +3568,9 @@ impl BTreeCursor {
                                 return Ok(CursorResult::Ok(()));
                             }
                         };
-                    } else {
-                        if self.reusable_immutable_record.borrow().is_none() {
-                            self.state = CursorState::None;
-                            return Ok(CursorResult::Ok(()));
-                        }
+                    } else if self.reusable_immutable_record.borrow().is_none() {
+                        self.state = CursorState::None;
+                        return Ok(CursorResult::Ok(()));
                     }
 
                     let delete_info = self.state.mut_delete_info().unwrap();
@@ -3856,7 +3857,7 @@ impl BTreeCursor {
             OwnedValue::Integer(i) => i,
             _ => unreachable!("btree tables are indexed by integers!"),
         };
-        let _ = return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
+        return_if_io!(self.move_to(SeekKey::TableRowId(*int_key as u64), SeekOp::EQ));
         let page = self.stack.top();
         // TODO(pere): request load
         return_if_locked!(page);
@@ -5198,7 +5199,6 @@ mod tests {
         types::Text,
         vdbe::Register,
         BufferPool, Connection, DatabaseStorage, StepResult, WalFile, WalFileShared,
-        WriteCompletion,
     };
     use std::{
         cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, panic, rc::Rc, sync::Arc,
@@ -5207,7 +5207,6 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        io::BufferData,
         storage::{
             btree::{
                 compute_free_space, fill_cell_payload, payload_overflow_threshold_max,
@@ -5226,16 +5225,9 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id));
 
-        let drop_fn = Rc::new(|_| {});
-        let inner = PageContent::new(
-            0,
-            Arc::new(RefCell::new(Buffer::new(
-                BufferData::new(vec![0; 4096]),
-                drop_fn,
-            ))),
-        );
+        let inner = PageContent::new(0, Buffer::new_temporary(4096));
         page.get().contents.replace(inner);
-
+        let page = page;
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
     }
@@ -5504,8 +5496,9 @@ mod tests {
         let io_file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
         let db_file = Arc::new(DatabaseFile::new(io_file));
 
-        let buffer_pool = Rc::new(BufferPool::new(page_size as usize));
-        let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
+        let buffer_pool = BufferPool::new(db_header.get_page_size() as usize, io.clone());
+        let wal_shared =
+            WalFileShared::open_shared(&io, "test.wal", db_header.get_page_size()).unwrap();
         let wal_file = WalFile::new(io.clone(), page_size, wal_shared, buffer_pool.clone());
         let wal = Rc::new(RefCell::new(wal_file));
 
@@ -5872,29 +5865,19 @@ mod tests {
         db_header.database_size = database_size;
         let db_header = Arc::new(SpinLock::new(db_header));
 
-        let buffer_pool = Rc::new(BufferPool::new(10));
-
-        // Initialize buffer pool with correctly sized buffers
-        for _ in 0..10 {
-            let vec = vec![0; page_size as usize]; // Initialize with correct length, not just capacity
-            buffer_pool.put(Pin::new(vec));
-        }
-
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::new(page_size as usize, io.clone());
+
         let db_file = Arc::new(DatabaseFile::new(
             io.open_file("test.db", OpenFlags::Create, false).unwrap(),
         ));
-
-        let drop_fn = Rc::new(|_buf| {});
-        let buf = Arc::new(RefCell::new(Buffer::allocate(page_size as usize, drop_fn)));
+        let buf = buffer_pool.get_page(Some(page_size as usize));
         {
-            let mut buf_mut = buf.borrow_mut();
-            let buf_slice = buf_mut.as_mut_slice();
+            let buf_slice = buf.as_mut_slice();
             sqlite3_ondisk::write_header_to_buf(buf_slice, &db_header.lock());
         }
 
-        let write_complete = Box::new(|_| {});
-        let c = Completion::Write(WriteCompletion::new(write_complete));
+        let c = Completion::new_write(|_| {});
         db_file.write_page(1, buf.clone(), c).unwrap();
 
         let wal_shared = WalFileShared::open_shared(&io, "test.wal", page_size).unwrap();
@@ -5937,14 +5920,8 @@ mod tests {
         // Setup overflow pages (2, 3, 4) with linking
         let mut current_page = 2u32;
         while current_page <= 4 {
-            let drop_fn = Rc::new(|_buf| {});
-            #[allow(clippy::arc_with_non_send_sync)]
-            let buf = Arc::new(RefCell::new(Buffer::allocate(
-                db_header.lock().get_page_size() as usize,
-                drop_fn,
-            )));
-            let write_complete = Box::new(|_| {});
-            let c = Completion::Write(WriteCompletion::new(write_complete));
+            let buf = Buffer::new_temporary(db_header.lock().get_page_size() as usize);
+            let c = Completion::new_write(|_| {});
             pager
                 .db_file
                 .write_page(current_page as usize, buf.clone(), c)?;

@@ -341,10 +341,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: Arc<limbo_core::Buffer>,
         c: limbo_core::Completion,
     ) -> limbo_core::Result<()> {
-        let size = buffer.borrow().len();
+        let size = buffer.len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())

@@ -213,28 +213,27 @@ impl limbo_core::File for File {
             limbo_core::Completion::Read(ref r) => r,
             _ => unreachable!(),
         };
-        {
-            let mut buf = r.buf_mut();
-            let buf: &mut [u8] = buf.as_mut_slice();
+        let nr = {
+            let buf = r.buf_mut();
             let nr = self.vfs.pread(self.fd, buf, pos);
             assert!(nr >= 0);
-        }
-        r.complete();
+            nr
+        };
+        r.complete(nr);
         Ok(())
     }
 
     fn pwrite(
         &self,
         pos: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: Arc<limbo_core::Buffer>,
         c: limbo_core::Completion,
     ) -> Result<()> {
         let w = match &c {
             limbo_core::Completion::Write(ref w) => w,
             _ => unreachable!(),
         };
-        let buf = buffer.borrow();
-        let buf: &[u8] = buf.as_slice();
+        let buf: &[u8] = buffer.as_slice();
         self.vfs.pwrite(self.fd, buf, pos);
         w.complete(buf.len() as i32);
         Ok(())
@@ -348,10 +347,10 @@ impl limbo_core::DatabaseStorage for DatabaseFile {
     fn write_page(
         &self,
         page_idx: usize,
-        buffer: Arc<std::cell::RefCell<limbo_core::Buffer>>,
+        buffer: Arc<limbo_core::Buffer>,
         c: limbo_core::Completion,
     ) -> Result<()> {
-        let size = buffer.borrow().len();
+        let size = buffer.len();
         let pos = (page_idx - 1) * size;
         self.file.pwrite(pos, buffer, c)?;
         Ok(())
