@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{select_star, Distinctness, JoinOrderMember, Operation, Search, SelectQueryType};
 use super::planner::Scope;
@@ -9,7 +11,7 @@ use crate::translate::planner::{
     bind_column_references, break_predicate_at_and_boundaries, parse_from, parse_limit,
     parse_where, resolve_aggregates,
 };
-use crate::util::normalize_ident;
+use crate::util::{normalize_ident, MaybeMut};
 use crate::vdbe::builder::{ProgramBuilderOpts, QueryMode};
 use crate::vdbe::insn::Insn;
 use crate::SymbolTable;
@@ -17,13 +19,13 @@ use crate::{schema::Schema, vdbe::builder::ProgramBuilder, Result};
 use limbo_sqlite3_parser::ast::{self, CompoundSelect, SortOrder};
 use limbo_sqlite3_parser::ast::{ResultColumn, SelectInner};
 
-pub fn translate_select(
+pub fn translate_select<'ast>(
     query_mode: QueryMode,
     schema: &Schema,
-    select: ast::Select,
+    select: &'ast mut ast::Select,
     syms: &SymbolTable,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> Result<ProgramBuilder<'ast>> {
     let mut select_plan = prepare_select_plan(schema, select, syms, None)?;
     optimize_plan(&mut select_plan, schema)?;
     let opts = match &select_plan {
@@ -59,22 +61,21 @@ pub fn translate_select(
     Ok(program)
 }
 
-pub fn prepare_select_plan<'a>(
+pub fn prepare_select_plan<'a, 'ast>(
     schema: &Schema,
-    mut select: ast::Select,
+    select: &'ast mut ast::Select,
     syms: &SymbolTable,
-    outer_scope: Option<&'a Scope<'a>>,
-) -> Result<Plan> {
-    let compounds = select.body.compounds.take();
-    match compounds {
+    outer_scope: Option<&'a Scope<'a, 'ast>>,
+) -> Result<Plan<'ast>> {
+    match select.body.compounds.as_mut() {
         None => {
             let limit = select.limit.take();
             Ok(Plan::Select(prepare_one_select_plan(
                 schema,
-                *select.body.select,
+                &mut (*select.body.select),
                 limit.as_deref(),
-                select.order_by.take(),
-                select.with.take(),
+                select.order_by.as_mut(),
+                select.with.as_mut(),
                 syms,
                 outer_scope,
             )?))
@@ -82,7 +83,7 @@ pub fn prepare_select_plan<'a>(
         Some(compounds) => {
             let mut first = prepare_one_select_plan(
                 schema,
-                *select.body.select,
+                &mut (*select.body.select),
                 None,
                 None,
                 None,
@@ -90,14 +91,18 @@ pub fn prepare_select_plan<'a>(
                 outer_scope,
             )?;
             let mut rest = Vec::with_capacity(compounds.len());
-            for CompoundSelect { select, operator } in compounds {
+            for CompoundSelect {
+                ref mut select,
+                operator,
+            } in compounds
+            {
                 // TODO: add support for UNION, EXCEPT and INTERSECT
-                if operator != ast::CompoundOperator::UnionAll {
+                if *operator != ast::CompoundOperator::UnionAll {
                     crate::bail_parse_error!("only UNION ALL is supported for compound SELECTs");
                 }
                 let plan =
-                    prepare_one_select_plan(schema, *select, None, None, None, syms, outer_scope)?;
-                rest.push((plan, operator));
+                    prepare_one_select_plan(schema, select, None, None, None, syms, outer_scope)?;
+                rest.push((plan, *operator));
             }
             // Ensure all subplans have same number of result columns
             let first_num_result_columns = first.result_columns.len();
@@ -106,7 +111,10 @@ pub fn prepare_select_plan<'a>(
                     crate::bail_parse_error!("SELECTs to the left and right of {} do not have the same number of result columns", operator);
                 }
             }
-            let (limit, offset) = select.limit.map_or(Ok((None, None)), |l| parse_limit(&l))?;
+            let (limit, offset) = select
+                .limit
+                .as_ref()
+                .map_or(Ok((None, None)), |l| parse_limit(&l))?;
 
             first.limit = limit.clone();
             for (plan, _) in rest.iter_mut() {
@@ -136,25 +144,25 @@ pub fn prepare_select_plan<'a>(
     }
 }
 
-fn prepare_one_select_plan<'a>(
+fn prepare_one_select_plan<'a, 'ast>(
     schema: &Schema,
-    select: ast::OneSelect,
+    select: &'ast mut ast::OneSelect,
     limit: Option<&ast::Limit>,
-    order_by: Option<Vec<ast::SortedColumn>>,
-    with: Option<ast::With>,
+    order_by: Option<&'ast mut Vec<ast::SortedColumn>>,
+    with: Option<&'ast mut ast::With>,
     syms: &SymbolTable,
-    outer_scope: Option<&'a Scope<'a>>,
-) -> Result<SelectPlan> {
+    outer_scope: Option<&'a Scope<'a, 'ast>>,
+) -> Result<SelectPlan<'ast>> {
     match select {
-        ast::OneSelect::Select(select_inner) => {
+        ast::OneSelect::Select(ref mut select_inner) => {
             let SelectInner {
-                mut columns,
-                from,
-                where_clause,
+                ref mut columns,
+                ref mut from,
+                ref mut where_clause,
                 group_by,
-                distinctness,
+                ref mut distinctness,
                 ..
-            } = *select_inner;
+            } = select_inner.as_mut();
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -163,8 +171,14 @@ fn prepare_one_select_plan<'a>(
             let mut where_predicates = vec![];
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
-            let table_references =
-                parse_from(schema, from, syms, with, &mut where_predicates, outer_scope)?;
+            let table_references = parse_from(
+                schema,
+                from.as_mut(),
+                syms,
+                with,
+                &mut where_predicates,
+                outer_scope,
+            )?;
 
             // Preallocate space for the result columns
             let result_columns = Vec::with_capacity(
@@ -240,12 +254,12 @@ fn prepare_one_select_plan<'a>(
                                 columns[idx].is_rowid_alias
                             };
                             plan.result_columns.push(ResultSetColumn {
-                                expr: ast::Expr::Column {
+                                expr: MaybeMut::Owned(ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table_index,
                                     column: idx,
                                     is_rowid_alias,
-                                },
+                                }),
                                 alias: None,
                                 contains_aggregates: false,
                             });
@@ -296,8 +310,8 @@ fn prepare_one_select_plan<'a>(
 
                                         let agg = Aggregate {
                                             func: f,
-                                            args: agg_args.clone(),
-                                            original_expr: expr.clone(),
+                                            args: agg_args,
+                                            original_expr: expr.to_owned(),
                                             distinctness,
                                         };
                                         aggregate_expressions.push(agg.clone());
@@ -306,7 +320,7 @@ fn prepare_one_select_plan<'a>(
                                                 ast::As::Elided(alias) => alias.0.clone(),
                                                 ast::As::As(alias) => alias.0.clone(),
                                             }),
-                                            expr: expr.clone(),
+                                            expr: MaybeMut::Mut(expr),
                                             contains_aggregates: true,
                                         });
                                     }
@@ -318,7 +332,7 @@ fn prepare_one_select_plan<'a>(
                                                 ast::As::Elided(alias) => alias.0.clone(),
                                                 ast::As::As(alias) => alias.0.clone(),
                                             }),
-                                            expr: expr.clone(),
+                                            expr: MaybeMut::Mut(expr),
                                             contains_aggregates,
                                         });
                                     }
@@ -339,13 +353,13 @@ fn prepare_one_select_plan<'a>(
                                                             ast::As::As(alias) => alias.0.clone(),
                                                         }
                                                     }),
-                                                    expr: expr.clone(),
+                                                    expr: MaybeMut::Mut(expr),
                                                     contains_aggregates,
                                                 });
                                             } else {
                                                 let agg = Aggregate {
                                                     func: AggFunc::External(f.func.clone().into()),
-                                                    args: args.as_ref().unwrap().clone(),
+                                                    args: args.clone().unwrap_or_default(),
                                                     original_expr: expr.clone(),
                                                     distinctness,
                                                 };
@@ -359,7 +373,7 @@ fn prepare_one_select_plan<'a>(
                                                             ast::As::As(alias) => alias.0.clone(),
                                                         }
                                                     }),
-                                                    expr: expr.clone(),
+                                                    expr: MaybeMut::Mut(expr),
                                                     contains_aggregates: true,
                                                 });
                                             }
@@ -392,7 +406,7 @@ fn prepare_one_select_plan<'a>(
                                             ast::As::Elided(alias) => alias.0.clone(),
                                             ast::As::As(alias) => alias.0.clone(),
                                         }),
-                                        expr: expr.clone(),
+                                        expr: MaybeMut::Mut(expr),
                                         contains_aggregates: true,
                                     });
                                 } else {
@@ -410,7 +424,7 @@ fn prepare_one_select_plan<'a>(
                                         ast::As::Elided(alias) => alias.0.clone(),
                                         ast::As::As(alias) => alias.0.clone(),
                                     }),
-                                    expr: expr.clone(),
+                                    expr: MaybeMut::Mut(expr),
                                     contains_aggregates,
                                 });
                             }
@@ -421,13 +435,13 @@ fn prepare_one_select_plan<'a>(
 
             // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
             parse_where(
-                where_clause,
+                where_clause.take(),
                 &mut plan.table_references,
                 Some(&plan.result_columns),
                 &mut plan.where_clause,
             )?;
 
-            if let Some(mut group_by) = group_by {
+            if let Some(ref mut group_by) = group_by {
                 for expr in group_by.exprs.iter_mut() {
                     replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
                     bind_column_references(
@@ -439,8 +453,8 @@ fn prepare_one_select_plan<'a>(
 
                 plan.group_by = Some(GroupBy {
                     sort_order: Some((0..group_by.exprs.len()).map(|_| SortOrder::Asc).collect()),
-                    exprs: group_by.exprs,
-                    having: if let Some(having) = group_by.having {
+                    exprs: group_by.exprs.iter_mut().map(MaybeMut::Mut).collect(),
+                    having: if let Some(having) = group_by.having.take() {
                         let mut predicates = vec![];
                         break_predicate_at_and_boundaries(*having, &mut predicates);
                         for expr in predicates.iter_mut() {
@@ -474,7 +488,7 @@ fn prepare_one_select_plan<'a>(
             if let Some(order_by) = order_by {
                 let mut key = Vec::new();
 
-                for mut o in order_by {
+                for o in order_by.iter_mut() {
                     replace_column_number_with_copy_of_column_expr(
                         &mut o.expr,
                         &plan.result_columns,
@@ -487,7 +501,10 @@ fn prepare_one_select_plan<'a>(
                     )?;
                     resolve_aggregates(&o.expr, &mut plan.aggregates)?;
 
-                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
+                    key.push((
+                        MaybeMut::Mut(&mut o.expr),
+                        o.order.unwrap_or(ast::SortOrder::Asc),
+                    ));
                 }
                 plan.order_by = Some(key);
             }
@@ -498,13 +515,13 @@ fn prepare_one_select_plan<'a>(
             // Return the unoptimized query plan
             Ok(plan)
         }
-        ast::OneSelect::Values(values) => {
+        ast::OneSelect::Values(ref mut values) => {
             let len = values[0].len();
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
                 result_columns.push(ResultSetColumn {
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
-                    expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
+                    expr: MaybeMut::Owned(ast::Expr::Literal(ast::Literal::Numeric(i.to_string()))),
                     alias: None,
                     contains_aggregates: false,
                 });
@@ -522,7 +539,10 @@ fn prepare_one_select_plan<'a>(
                 contains_constant_false_condition: false,
                 query_type: SelectQueryType::TopLevel,
                 distinctness: Distinctness::NonDistinct,
-                values,
+                values: values
+                    .iter_mut()
+                    .map(|row| row.iter_mut().map(MaybeMut::Mut).collect())
+                    .collect(),
             };
 
             Ok(plan)
@@ -545,7 +565,7 @@ fn replace_column_number_with_copy_of_column_expr(
         let maybe_result_column = columns.get(column_number - 1);
         match maybe_result_column {
             Some(ResultSetColumn { expr, .. }) => {
-                *order_by_or_group_by_expr = expr.clone();
+                *order_by_or_group_by_expr = expr.deref().clone();
             }
             None => {
                 crate::bail_parse_error!("invalid column index: {}", column_number)

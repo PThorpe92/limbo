@@ -9,15 +9,15 @@ use limbo_sqlite3_parser::ast::{Expr, Limit, QualifiedName};
 
 use super::plan::{ColumnUsedMask, IterationDirection, TableReference};
 
-pub fn translate_delete(
+pub fn translate_delete<'ast>(
     query_mode: QueryMode,
     schema: &Schema,
-    tbl_name: &QualifiedName,
+    tbl_name: &'ast QualifiedName,
     where_clause: Option<Box<Expr>>,
     limit: Option<Box<Limit>>,
     syms: &SymbolTable,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> Result<ProgramBuilder<'ast>> {
     let mut delete_plan = prepare_delete_plan(schema, tbl_name, where_clause, limit)?;
     optimize_plan(&mut delete_plan, schema)?;
     let Plan::Delete(ref delete) = delete_plan else {
@@ -34,12 +34,12 @@ pub fn translate_delete(
     Ok(program)
 }
 
-pub fn prepare_delete_plan(
+pub fn prepare_delete_plan<'ast>(
     schema: &Schema,
-    tbl_name: &QualifiedName,
+    tbl_name: &'ast QualifiedName,
     where_clause: Option<Box<Expr>>,
     limit: Option<Box<Limit>>,
-) -> Result<Plan> {
+) -> Result<Plan<'ast>> {
     let table = match schema.get_table(tbl_name.name.0.as_str()) {
         Some(table) => table,
         None => crate::bail_corrupt_error!("Parse error: no such table: {}", tbl_name),

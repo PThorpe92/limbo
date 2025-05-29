@@ -14,15 +14,15 @@ use limbo_sqlite3_parser::ast::{self, Expr, Id, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-pub fn translate_create_index(
+pub fn translate_create_index<'ast>(
     mode: QueryMode,
     unique_if_not_exists: (bool, bool),
-    idx_name: &str,
-    tbl_name: &str,
+    idx_name: &'ast str,
+    tbl_name: &'ast str,
     columns: &[SortedColumn],
     schema: &Schema,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> crate::Result<ProgramBuilder<'ast>> {
     let idx_name = normalize_ident(idx_name);
     let tbl_name = normalize_ident(tbl_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
@@ -300,13 +300,13 @@ fn create_idx_stmt_to_sql(
     sql
 }
 
-pub fn translate_drop_index(
+pub fn translate_drop_index<'ast>(
     mode: QueryMode,
-    idx_name: &str,
+    idx_name: &'ast str,
     if_exists: bool,
     schema: &Schema,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> crate::Result<ProgramBuilder<'ast>> {
     let idx_name = normalize_ident(idx_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         query_mode: mode,

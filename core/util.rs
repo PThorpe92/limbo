@@ -5,7 +5,13 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable, IO,
 };
 use limbo_sqlite3_parser::ast::{self, CreateTableBody, Expr, FunctionTail, Literal};
-use std::{rc::Rc, sync::Arc};
+use std::{
+    borrow::{Borrow, BorrowMut},
+    fmt,
+    ops::{Deref, DerefMut},
+    rc::Rc,
+    sync::Arc,
+};
 
 pub trait RoundToPrecision {
     fn round_to_precision(self, precision: i32) -> f64;
@@ -15,6 +21,145 @@ impl RoundToPrecision for f64 {
     fn round_to_precision(self, precision: i32) -> f64 {
         let factor = 10f64.powi(precision);
         (self * factor).round() / factor
+    }
+}
+
+pub enum MaybeMut<'ast, B: ?Sized + 'ast>
+where
+    B: ToOwned,
+{
+    Mut(&'ast mut B),
+    Owned(<B as ToOwned>::Owned),
+}
+
+impl<'ast, B: ?Sized> Clone for MaybeMut<'ast, B>
+where
+    B: ToOwned,
+{
+    fn clone(&self) -> MaybeMut<'ast, B> {
+        Self::Owned((&**self).to_owned())
+    }
+}
+
+impl<'a, B: ?Sized> Deref for MaybeMut<'a, B>
+where
+    B: ToOwned,
+{
+    type Target = B;
+    fn deref(&self) -> &B {
+        match *self {
+            Self::Mut(ref val) => val,
+            Self::Owned(ref owned) => owned.borrow(),
+        }
+    }
+}
+
+impl<'ast, B: ?Sized> MaybeMut<'ast, B>
+where
+    B: ToOwned,
+{
+    pub fn into_owned(self) -> <B as ToOwned>::Owned {
+        match self {
+            Self::Mut(borrowed) => borrowed.to_owned(),
+            Self::Owned(owned) => owned,
+        }
+    }
+}
+
+impl<'ast, B: ?Sized> DerefMut for MaybeMut<'ast, B>
+where
+    B: ToOwned,
+    B::Owned: BorrowMut<B>,
+{
+    fn deref_mut(&mut self) -> &mut B {
+        match *self {
+            Self::Mut(ref mut borrowed) => borrowed,
+            Self::Owned(ref mut owned) => owned.borrow_mut(),
+        }
+    }
+}
+
+impl<'ast, B: ?Sized> fmt::Debug for MaybeMut<'ast, B>
+where
+    B: fmt::Debug + ToOwned,
+    <B as ToOwned>::Owned: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Mut(ref b) => fmt::Debug::fmt(b, f),
+            Self::Owned(ref o) => fmt::Debug::fmt(o, f),
+        }
+    }
+}
+
+impl<'ast, B: ?Sized> fmt::Display for MaybeMut<'ast, B>
+where
+    B: fmt::Display + ToOwned,
+    <B as ToOwned>::Owned: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Mut(ref b) => fmt::Display::fmt(b, f),
+            Self::Owned(ref o) => fmt::Display::fmt(o, f),
+        }
+    }
+}
+
+impl<'ast, B: ?Sized> Borrow<B> for MaybeMut<'ast, B>
+where
+    B: ToOwned,
+    B::Owned: 'ast,
+{
+    fn borrow(&self) -> &B {
+        &**self
+    }
+}
+
+impl<'ast, B: ?Sized> BorrowMut<B> for MaybeMut<'ast, B>
+where
+    B: ToOwned,
+    B::Owned: 'ast + BorrowMut<B>,
+{
+    fn borrow_mut(&mut self) -> &mut B {
+        &mut **self
+    }
+}
+
+impl<'ast, T: ?Sized + ToOwned> AsRef<T> for MaybeMut<'ast, T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<'ast, B: ?Sized> Eq for MaybeMut<'ast, B> where B: Eq + ToOwned {}
+
+impl<'ast, B: ?Sized> Ord for MaybeMut<'ast, B>
+where
+    B: Ord + ToOwned,
+{
+    #[inline]
+    fn cmp(&self, other: &MaybeMut<'ast, B>) -> std::cmp::Ordering {
+        Ord::cmp(&**self, &**other)
+    }
+}
+
+impl<'ast, 'b, B: ?Sized, C: ?Sized> PartialEq<MaybeMut<'b, C>> for MaybeMut<'ast, B>
+where
+    B: PartialEq<C> + ToOwned,
+    C: ToOwned,
+{
+    fn eq(&self, other: &MaybeMut<'b, C>) -> bool {
+        PartialEq::eq(&**self, &**other)
+    }
+}
+
+impl<'ast, B: ?Sized> PartialOrd for MaybeMut<'ast, B>
+where
+    B: PartialOrd + ToOwned,
+{
+    #[inline]
+    fn partial_cmp(&self, other: &MaybeMut<'ast, B>) -> Option<std::cmp::Ordering> {
+        PartialOrd::partial_cmp(&**self, &**other)
     }
 }
 

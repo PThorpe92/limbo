@@ -20,8 +20,8 @@ use crate::{
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, Operation, Plan, Search, SeekDef,
-        SeekKey, SelectPlan, TableReference, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, Operation, Plan, PlanExpr,
+        Search, SeekDef, SeekKey, SelectPlan, TableReference, UpdatePlan, WhereTerm,
     },
 };
 
@@ -136,11 +136,11 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 /// - Removes sorting operations if the selected join order and access methods satisfy the [crate::translate::optimizer::order::OrderTarget].
 ///
 /// Returns the join order if it was optimized, or None if the default join order was considered best.
-fn optimize_table_access(
-    table_references: &mut [TableReference],
+fn optimize_table_access<'ast>(
+    table_references: &'ast mut [TableReference<'ast>],
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
-    where_clause: &mut Vec<WhereTerm>,
-    order_by: &mut Option<Vec<(ast::Expr, SortOrder)>>,
+    where_clause: &'ast mut Vec<WhereTerm<'ast>>,
+    order_by: &mut Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     group_by: &mut Option<GroupBy>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
     let access_methods_arena = RefCell::new(Vec::new());
@@ -802,12 +802,12 @@ fn ephemeral_index_build(
 }
 
 /// Build a [SeekDef] for a given list of [Constraint]s
-pub fn build_seek_def_from_constraints(
+pub fn build_seek_def_from_constraints<'ast>(
     constraints: &[Constraint],
     constraint_refs: &[ConstraintRef],
     iter_dir: IterationDirection,
-    where_clause: &[WhereTerm],
-) -> Result<SeekDef> {
+    where_clause: &[WhereTerm<'ast>],
+) -> Result<SeekDef<'ast>> {
     assert!(
         !constraint_refs.is_empty(),
         "cannot build seek def from empty list of constraint refs"
@@ -852,11 +852,11 @@ pub fn build_seek_def_from_constraints(
 /// since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
 /// So when you see e.g. a SeekOp::GT below for a descending index, it actually means that we are seeking the first row where the index key is LESS than the seek key.
 ///
-fn build_seek_def(
+fn build_seek_def<'ast>(
     op: ast::Operator,
     iter_dir: IterationDirection,
-    key: Vec<(ast::Expr, SortOrder)>,
-) -> Result<SeekDef> {
+    key: Vec<(PlanExpr<'ast>, SortOrder)>,
+) -> Result<SeekDef<'ast>> {
     let key_len = key.len();
     let sort_order_of_last_key = key.last().unwrap().1;
 

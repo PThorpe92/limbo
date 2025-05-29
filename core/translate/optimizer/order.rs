@@ -1,9 +1,9 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, ops::Deref};
 
 use limbo_sqlite3_parser::ast::{self, SortOrder};
 
 use crate::{
-    translate::plan::{GroupBy, IterationDirection, TableReference},
+    translate::plan::{GroupBy, IterationDirection, PlanExpr, TableReference},
     util::exprs_are_equivalent,
 };
 
@@ -32,22 +32,25 @@ pub enum EliminatesSort {
 pub struct OrderTarget(pub Vec<ColumnOrder>, pub EliminatesSort);
 
 impl OrderTarget {
-    fn maybe_from_iterator<'a>(
-        list: impl Iterator<Item = (&'a ast::Expr, SortOrder)> + Clone,
+    fn maybe_from_iterator<'a, 'ast>(
+        list: impl Iterator<Item = (&'a PlanExpr<'ast>, SortOrder)> + Clone,
         eliminates_sort: EliminatesSort,
-    ) -> Option<Self> {
+    ) -> Option<Self>
+    where
+        'ast: 'a,
+    {
         if list.clone().count() == 0 {
             return None;
         }
         if list
             .clone()
-            .any(|(expr, _)| !matches!(expr, ast::Expr::Column { .. }))
+            .any(|(expr, _)| !matches!(expr.deref(), ast::Expr::Column { .. }))
         {
             return None;
         }
         Some(OrderTarget(
             list.map(|(expr, order)| {
-                let ast::Expr::Column { table, column, .. } = expr else {
+                let ast::Expr::Column { table, column, .. } = expr.deref() else {
                     unreachable!();
                 };
                 ColumnOrder {
@@ -69,8 +72,8 @@ impl OrderTarget {
 ///
 /// TODO: this does not currently handle the case where we definitely cannot eliminate
 /// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
-pub fn compute_order_target(
-    order_by_opt: &mut Option<Vec<(ast::Expr, SortOrder)>>,
+pub fn compute_order_target<'ast>(
+    order_by_opt: &mut Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     group_by_opt: Option<&mut GroupBy>,
 ) -> Option<OrderTarget> {
     match (&order_by_opt, group_by_opt) {

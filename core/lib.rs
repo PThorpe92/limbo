@@ -77,6 +77,7 @@ use translate::select::prepare_select_plan;
 pub use types::RefValue;
 pub use types::Value;
 use util::{columns_from_create_table_body, parse_schema_rows};
+use vdbe::builder::query_mode_from_stmt;
 use vdbe::{builder::QueryMode, VTabOpaqueCursor};
 pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 pub static DATABASE_VERSION: OnceLock<String> = OnceLock::new();
@@ -346,9 +347,10 @@ impl Connection {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next()?;
         let syms = self.syms.borrow();
-        let cmd = cmd.expect("Successful parse on nonempty input string should produce a command");
+        let mut cmd =
+            cmd.expect("Successful parse on nonempty input string should produce a command");
         match cmd {
-            Cmd::Stmt(stmt) => {
+            Cmd::Stmt(ref mut stmt) => {
                 let program = Rc::new(translate::translate(
                     self.schema
                         .try_read()
@@ -383,21 +385,22 @@ impl Connection {
         }
     }
 
-    pub(crate) fn run_cmd(self: &Rc<Connection>, cmd: Cmd) -> Result<Option<Statement>> {
+    pub(crate) fn run_cmd(self: &Rc<Connection>, mut cmd: Cmd) -> Result<Option<Statement>> {
         let syms = self.syms.borrow();
+        let query_mode = query_mode_from_stmt(&mut cmd);
         match cmd {
-            Cmd::Stmt(ref stmt) | Cmd::Explain(ref stmt) => {
+            Cmd::Stmt(ref mut stmt) | Cmd::Explain(ref mut stmt) => {
                 let program = translate::translate(
                     self.schema
                         .try_read()
                         .ok_or(LimboError::SchemaLocked)?
                         .deref(),
-                    stmt.clone(),
+                    stmt,
                     self.header.clone(),
                     self.pager.clone(),
                     Rc::downgrade(self),
                     &syms,
-                    cmd.into(),
+                    query_mode,
                 )?;
                 let stmt = Statement::new(
                     program.into(),
@@ -406,15 +409,15 @@ impl Connection {
                 );
                 Ok(Some(stmt))
             }
-            Cmd::ExplainQueryPlan(stmt) => {
+            Cmd::ExplainQueryPlan(ref mut stmt) => {
                 match stmt {
-                    ast::Stmt::Select(select) => {
+                    ast::Stmt::Select(ref mut select) => {
                         let mut plan = prepare_select_plan(
                             self.schema
                                 .try_read()
                                 .ok_or(LimboError::SchemaLocked)?
                                 .deref(),
-                            *select,
+                            select,
                             &syms,
                             None,
                         )?;
@@ -443,11 +446,11 @@ impl Connection {
     pub fn execute(self: &Rc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         let sql = sql.as_ref();
         let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser.next()?;
+        let mut cmd = parser.next()?;
         let syms = self.syms.borrow();
-        if let Some(cmd) = cmd {
+        if let Some(ref mut cmd) = cmd {
             match cmd {
-                Cmd::Explain(stmt) => {
+                Cmd::Explain(ref mut stmt) => {
                     let program = translate::translate(
                         self.schema
                             .try_read()
@@ -463,7 +466,7 @@ impl Connection {
                     let _ = std::io::stdout().write_all(program.explain().as_bytes());
                 }
                 Cmd::ExplainQueryPlan(_stmt) => todo!(),
-                Cmd::Stmt(stmt) => {
+                Cmd::Stmt(ref mut stmt) => {
                     let program = translate::translate(
                         self.schema
                             .try_read()
@@ -815,13 +818,13 @@ impl VirtualTable {
     }
 
     /// takes ownership of the provided Args
-    pub(crate) fn from_args(
+    pub(crate) fn from_args<'ast>(
         tbl_name: Option<&str>,
         module_name: &str,
         args: Vec<limbo_ext::Value>,
         syms: &SymbolTable,
         kind: VTabKind,
-        exprs: Option<Vec<ast::Expr>>,
+        exprs: Option<&'ast mut Vec<ast::Expr>>,
     ) -> Result<Rc<Self>> {
         let module = syms
             .vtab_modules
@@ -849,7 +852,7 @@ impl VirtualTable {
                 connection_ptr: RefCell::new(None),
                 implementation: module.implementation.clone(),
                 columns,
-                args: exprs,
+                args: exprs.cloned(),
                 kind,
                 table_ptr,
             });

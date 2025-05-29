@@ -1,3 +1,5 @@
+use std::ops::Deref;
+
 use super::{
     expr::walk_expr,
     plan::{
@@ -12,7 +14,7 @@ use crate::{
     function::Func,
     schema::{Schema, Table},
     translate::expr::walk_expr_mut,
-    util::{exprs_are_equivalent, normalize_ident, vtable_args},
+    util::{exprs_are_equivalent, normalize_ident, vtable_args, MaybeMut},
     vdbe::BranchOffset,
     Result,
 };
@@ -149,7 +151,7 @@ pub fn bind_column_references(
                             .name(referenced_tables)
                             .map_or(false, |name| name.eq_ignore_ascii_case(&normalized_id))
                         {
-                            *expr = result_column.expr.clone();
+                            *expr = result_column.expr.deref().clone();
                             return Ok(());
                         }
                     }
@@ -198,10 +200,10 @@ pub fn bind_column_references(
     })
 }
 
-fn parse_from_clause_table<'a>(
+fn parse_from_clause_table<'a, 'ast>(
     schema: &Schema,
-    table: ast::SelectTable,
-    scope: &mut Scope<'a>,
+    table: &'ast mut ast::SelectTable,
+    scope: &mut Scope<'a, 'ast>,
     syms: &SymbolTable,
 ) -> Result<()> {
     match table {
@@ -223,11 +225,12 @@ fn parse_from_clause_table<'a>(
             // Check if our top level schema has this table.
             if let Some(table) = schema.get_table(&normalized_qualified_name) {
                 let alias = maybe_alias
+                    .as_ref()
                     .map(|a| match a {
                         ast::As::As(id) => id,
                         ast::As::Elided(id) => id,
                     })
-                    .map(|a| a.0);
+                    .cloned();
                 let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
                     Table::Virtual(tbl.clone())
                 } else if let Table::BTree(table) = table.as_ref() {
@@ -243,7 +246,7 @@ fn parse_from_clause_table<'a>(
                         index: None,
                     },
                     table: tbl_ref,
-                    identifier: alias.unwrap_or(normalized_qualified_name),
+                    identifier: alias.map(|v| v.0).unwrap_or(normalized_qualified_name),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::new(),
                 });
@@ -276,9 +279,9 @@ fn parse_from_clause_table<'a>(
 
             crate::bail_parse_error!("Table {} not found", normalized_qualified_name);
         }
-        ast::SelectTable::Select(subselect, maybe_alias) => {
+        ast::SelectTable::Select(ref mut subselect, maybe_alias) => {
             let Plan::Select(mut subplan) =
-                prepare_select_plan(schema, *subselect, syms, Some(scope))?
+                prepare_select_plan(schema, subselect, syms, Some(scope))?
             else {
                 crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
             };
@@ -288,6 +291,7 @@ fn parse_from_clause_table<'a>(
             };
             let cur_table_index = scope.tables.len();
             let identifier = maybe_alias
+                .as_ref()
                 .map(|a| match a {
                     ast::As::As(id) => id.0.clone(),
                     ast::As::Elided(id) => id.0.clone(),
@@ -310,7 +314,7 @@ fn parse_from_clause_table<'a>(
                 args,
                 syms,
                 limbo_ext::VTabKind::TableValuedFunction,
-                maybe_args,
+                maybe_args.as_mut(),
             )?;
             let alias = maybe_alias
                 .as_ref()
@@ -361,30 +365,30 @@ fn parse_from_clause_table<'a>(
 ///
 /// Currently we are treating Schema as a first-class object in identifier resolution, when in reality
 /// be part of the 'Scope' struct.
-pub struct Scope<'a> {
+pub struct Scope<'a, 'ast> {
     /// The tables that are explicitly present in the current query, including catalog tables and CTEs.
-    tables: Vec<TableReference>,
-    ctes: Vec<Cte>,
+    tables: Vec<TableReference<'ast>>,
+    ctes: Vec<Cte<'ast>>,
     /// The parent scope, if any. For example, a second CTE has access to the first CTE via the parent scope.
-    parent: Option<&'a Scope<'a>>,
+    parent: Option<&'a Scope<'a, 'ast>>,
 }
 
-pub struct Cte {
+pub struct Cte<'ast> {
     /// The name of the CTE.
     name: String,
     /// The query plan for the CTE.
     /// Currently we only support SELECT queries in CTEs.
-    plan: SelectPlan,
+    plan: SelectPlan<'ast>,
 }
 
-pub fn parse_from<'a>(
+pub fn parse_from<'a, 'ast>(
     schema: &Schema,
-    mut from: Option<FromClause>,
+    from: Option<&'ast mut FromClause>,
     syms: &SymbolTable,
-    with: Option<With>,
-    out_where_clause: &mut Vec<WhereTerm>,
-    outer_scope: Option<&'a Scope<'a>>,
-) -> Result<Vec<TableReference>> {
+    with: Option<&'ast mut With>,
+    out_where_clause: &mut Vec<WhereTerm<'ast>>,
+    outer_scope: Option<&'a Scope<'a, 'ast>>,
+) -> Result<Vec<TableReference<'ast>>> {
     if from.as_ref().and_then(|f| f.select.as_ref()).is_none() {
         return Ok(vec![]);
     }
@@ -399,7 +403,7 @@ pub fn parse_from<'a>(
         if with.recursive {
             crate::bail_parse_error!("Recursive CTEs are not yet supported");
         }
-        for cte in with.ctes {
+        for cte in &mut with.ctes {
             if cte.materialized == Materialized::Yes {
                 crate::bail_parse_error!("Materialized CTEs are not yet supported");
             }
@@ -429,7 +433,7 @@ pub fn parse_from<'a>(
             }
 
             // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
-            let cte_plan = prepare_select_plan(schema, *cte.select, syms, Some(&scope))?;
+            let cte_plan = prepare_select_plan(schema, &mut cte.select, syms, Some(&scope))?;
             let Plan::Select(mut cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
@@ -445,33 +449,42 @@ pub fn parse_from<'a>(
         }
     }
 
-    let mut from_owned = std::mem::take(&mut from).unwrap();
-    let select_owned = *std::mem::take(&mut from_owned.select).unwrap();
-    let joins_owned = std::mem::take(&mut from_owned.joins).unwrap_or_default();
-    parse_from_clause_table(schema, select_owned, &mut scope, syms)?;
-
-    for join in joins_owned.into_iter() {
-        parse_join(schema, join, syms, &mut scope, out_where_clause)?;
+    if let Some(from) = from {
+        parse_from_clause_table(
+            schema,
+            from.select
+                .as_deref_mut()
+                .expect("from clause has mandatory select"),
+            &mut scope,
+            syms,
+        )?;
+        if let Some(ref mut joins) = from.joins {
+            for join in joins.iter_mut() {
+                parse_join(schema, join, syms, &mut scope, out_where_clause)?;
+            }
+        }
     }
 
     Ok(scope.tables)
 }
 
-pub fn parse_where(
+pub fn parse_where<'ast>(
     where_clause: Option<Expr>,
     table_references: &mut [TableReference],
     result_columns: Option<&[ResultSetColumn]>,
-    out_where_clause: &mut Vec<WhereTerm>,
+    out_where_clause: &mut Vec<WhereTerm<'ast>>,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let mut predicates = vec![];
         break_predicate_at_and_boundaries(where_expr, &mut predicates);
+
         for expr in predicates.iter_mut() {
             bind_column_references(expr, table_references, result_columns)?;
         }
+
         for expr in predicates {
             out_where_clause.push(WhereTerm {
-                expr,
+                expr: MaybeMut::Owned(expr),
                 from_outer_join: None,
                 consumed: false,
             });
@@ -634,12 +647,12 @@ pub fn determine_where_to_eval_expr<'a>(
     Ok(eval_at)
 }
 
-fn parse_join<'a>(
+fn parse_join<'a, 'ast>(
     schema: &Schema,
-    join: ast::JoinedSelectTable,
+    join: &'ast mut ast::JoinedSelectTable,
     syms: &SymbolTable,
-    scope: &mut Scope<'a>,
-    out_where_clause: &mut Vec<WhereTerm>,
+    scope: &mut Scope<'a, 'ast>,
+    out_where_clause: &mut Vec<WhereTerm<'ast>>,
 ) -> Result<()> {
     let ast::JoinedSelectTable {
         operator: join_operator,
@@ -702,7 +715,7 @@ fn parse_join<'a>(
             crate::bail_parse_error!("No columns found to NATURAL join on");
         }
     } else {
-        constraint
+        constraint.take()
     };
 
     if let Some(constraint) = constraint {
@@ -715,7 +728,7 @@ fn parse_join<'a>(
                 }
                 for pred in preds {
                     out_where_clause.push(WhereTerm {
-                        expr: pred,
+                        expr: MaybeMut::Owned(pred),
                         from_outer_join: if outer {
                             Some(scope.tables.len() - 1)
                         } else {
@@ -789,7 +802,7 @@ fn parse_join<'a>(
                     let right_table = scope.tables.get_mut(cur_table_idx).unwrap();
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
-                        expr,
+                        expr: MaybeMut::Owned(expr),
                         from_outer_join: if outer { Some(cur_table_idx) } else { None },
                         consumed: false,
                     });

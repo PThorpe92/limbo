@@ -4,6 +4,7 @@ use limbo_sqlite3_parser::ast::{self, SortOrder};
 use std::{
     cmp::Ordering,
     fmt::{Display, Formatter},
+    ops::Deref,
     rc::Rc,
     sync::Arc,
 };
@@ -11,7 +12,7 @@ use std::{
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, Column, FromClauseSubquery, Index, Table},
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, MaybeMut},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{IdxInsertFlags, Insn},
@@ -24,19 +25,19 @@ use crate::{schema::Type, types::SeekOp, util::can_pushdown_predicate};
 use super::{emitter::OperationMode, planner::determine_where_to_eval_term, schema::ParseSchema};
 
 #[derive(Debug, Clone)]
-pub struct ResultSetColumn {
-    pub expr: ast::Expr,
+pub struct ResultSetColumn<'ast> {
+    pub expr: PlanExpr<'ast>,
     pub alias: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
 }
 
-impl ResultSetColumn {
+impl<'ast> ResultSetColumn<'_> {
     pub fn name<'a>(&'a self, tables: &'a [TableReference]) -> Option<&'a str> {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        match &self.expr.deref() {
             ast::Expr::Column { table, column, .. } => {
                 tables[*table].columns()[*column].name.as_deref()
             }
@@ -59,13 +60,15 @@ impl ResultSetColumn {
 }
 
 #[derive(Debug, Clone)]
-pub struct GroupBy {
-    pub exprs: Vec<ast::Expr>,
+pub struct GroupBy<'ast> {
+    pub exprs: Vec<PlanExpr<'ast>>,
     /// sort order, if a sorter is required (= the columns aren't already in the correct order)
     pub sort_order: Option<Vec<SortOrder>>,
     /// having clause split into a vec at 'AND' boundaries.
-    pub having: Option<Vec<ast::Expr>>,
+    pub having: Option<Vec<Expr>>,
 }
+
+pub type PlanExpr<'ast> = MaybeMut<'ast, ast::Expr>;
 
 /// In a query plan, WHERE clause conditions and JOIN conditions are all folded into a vector of WhereTerm.
 /// This is done so that we can evaluate the conditions at the correct loop depth.
@@ -74,9 +77,9 @@ pub struct GroupBy {
 /// Even though the condition only refers to 'u', we CANNOT evaluate it at the users loop, because we need to emit NULL
 /// values for the columns of 'p', for EVERY row in 'u', instead of completely skipping any rows in 'u' where the condition is false.
 #[derive(Debug, Clone)]
-pub struct WhereTerm {
+pub struct WhereTerm<'ast> {
     /// The original condition expression.
-    pub expr: ast::Expr,
+    pub expr: PlanExpr<'ast>,
     /// Is this condition originally from an OUTER JOIN, and which table number in the plan's [TableReference] vector?
     /// If so, we need to evaluate it at the loop of the right table in that JOIN,
     /// regardless of which tables it references.
@@ -90,7 +93,7 @@ pub struct WhereTerm {
     pub consumed: bool,
 }
 
-impl WhereTerm {
+impl<'ast> WhereTerm<'_> {
     pub fn should_eval_before_loop(&self, join_order: &[JoinOrderMember]) -> bool {
         if self.consumed {
             return false;
@@ -165,7 +168,7 @@ pub fn convert_where_to_vtab_constraint(
     if term.from_outer_join.is_some() {
         return Ok(None);
     }
-    let Expr::Binary(lhs, op, rhs) = &term.expr else {
+    let Expr::Binary(lhs, op, rhs) = &term.expr.deref() else {
         return Ok(None);
     };
     let expr_is_ready = |e: &Expr| -> Result<bool> { can_pushdown_predicate(e, table_index) };
@@ -262,17 +265,17 @@ impl Ord for EvalAt {
 
 /// A query plan is either a SELECT or a DELETE (for now)
 #[derive(Debug, Clone)]
-pub enum Plan {
-    Select(SelectPlan),
+pub enum Plan<'ast> {
+    Select(SelectPlan<'ast>),
     CompoundSelect {
-        first: SelectPlan,
-        rest: Vec<(SelectPlan, ast::CompoundOperator)>,
+        first: SelectPlan<'ast>,
+        rest: Vec<(SelectPlan<'ast>, ast::CompoundOperator)>,
         limit: Option<isize>,
         offset: Option<isize>,
-        order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+        order_by: Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     },
-    Delete(DeletePlan),
-    Update(UpdatePlan),
+    Delete(DeletePlan<'ast>),
+    Update(UpdatePlan<'ast>),
 }
 
 /// The type of the query, either top level or subquery
@@ -362,7 +365,7 @@ impl DistinctCtx {
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: self.cursor_id,
-            record_reg: record_reg,
+            record_reg,
             unpacked_start: None,
             unpacked_count: None,
             flags: IdxInsertFlags::new(),
@@ -370,21 +373,22 @@ impl DistinctCtx {
     }
 }
 
+// None Expr::null
 #[derive(Debug, Clone)]
-pub struct SelectPlan {
+pub struct SelectPlan<'ast> {
     /// List of table references in loop order, outermost first.
-    pub table_references: Vec<TableReference>,
+    pub table_references: Vec<TableReference<'ast>>,
     /// The order in which the tables are joined. Tables have usize Ids (their index in table_references)
     pub join_order: Vec<JoinOrderMember>,
     /// the columns inside SELECT ... FROM
-    pub result_columns: Vec<ResultSetColumn>,
+    pub result_columns: Vec<ResultSetColumn<'ast>>,
     /// where clause split into a vec at 'AND' boundaries. all join conditions also get shoved in here,
     /// and we keep track of which join they came from (mainly for OUTER JOIN processing)
-    pub where_clause: Vec<WhereTerm>,
+    pub where_clause: Vec<WhereTerm<'ast>>,
     /// group by clause
-    pub group_by: Option<GroupBy>,
+    pub group_by: Option<GroupBy<'ast>>,
     /// order by clause
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    pub order_by: Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     /// all the aggregates collected from the result columns, order by, and (TODO) having clauses
     pub aggregates: Vec<Aggregate>,
     /// limit clause
@@ -398,10 +402,10 @@ pub struct SelectPlan {
     /// whether the query is DISTINCT
     pub distinctness: Distinctness,
     /// values: https://sqlite.org/syntax/select-core.html
-    pub values: Vec<Vec<Expr>>,
+    pub values: Vec<Vec<PlanExpr<'ast>>>,
 }
 
-impl SelectPlan {
+impl<'ast> SelectPlan<'ast> {
     pub fn agg_args_count(&self) -> usize {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
@@ -412,7 +416,7 @@ impl SelectPlan {
             .map_or(0, |group_by| group_by.exprs.len())
     }
 
-    pub fn non_group_by_non_agg_columns(&self) -> impl Iterator<Item = &ast::Expr> {
+    pub fn non_group_by_non_agg_columns(&self) -> impl Iterator<Item = &PlanExpr<'ast>> {
         self.result_columns
             .iter()
             .filter(|c| {
@@ -471,7 +475,7 @@ impl SelectPlan {
             filter_over: None,
         };
         let result_col_expr = &self.result_columns.first().unwrap().expr;
-        if *result_col_expr != count && *result_col_expr != count_star {
+        if *result_col_expr.deref() != count && *result_col_expr.deref() != count_star {
             return false;
         }
         true
@@ -480,15 +484,15 @@ impl SelectPlan {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct DeletePlan {
+pub struct DeletePlan<'ast> {
     /// List of table references. Delete is always a single table.
-    pub table_references: Vec<TableReference>,
+    pub table_references: Vec<TableReference<'ast>>,
     /// the columns inside SELECT ... FROM
-    pub result_columns: Vec<ResultSetColumn>,
+    pub result_columns: Vec<ResultSetColumn<'ast>>,
     /// where clause split into a vec at 'AND' boundaries.
-    pub where_clause: Vec<WhereTerm>,
+    pub where_clause: Vec<WhereTerm<'ast>>,
     /// order by clause
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    pub order_by: Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     /// limit clause
     pub limit: Option<isize>,
     /// offset clause
@@ -500,17 +504,17 @@ pub struct DeletePlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct UpdatePlan {
+pub struct UpdatePlan<'ast> {
     // table being updated is always first
-    pub table_references: Vec<TableReference>,
+    pub table_references: Vec<TableReference<'ast>>,
     // (colum index, new value) pairs
-    pub set_clauses: Vec<(usize, ast::Expr)>,
-    pub where_clause: Vec<WhereTerm>,
-    pub order_by: Option<Vec<(ast::Expr, SortOrder)>>,
+    pub set_clauses: Vec<(usize, PlanExpr<'ast>)>,
+    pub where_clause: Vec<WhereTerm<'ast>>,
+    pub order_by: Option<Vec<(PlanExpr<'ast>, SortOrder)>>,
     pub limit: Option<isize>,
     pub offset: Option<isize>,
     // TODO: optional RETURNING clause
-    pub returning: Option<Vec<ResultSetColumn>>,
+    pub returning: Option<Vec<ResultSetColumn<'ast>>>,
     // whether the WHERE clause is always false
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,
@@ -549,12 +553,12 @@ pub fn select_star(tables: &[TableReference], out_columns: &mut Vec<ResultSetCol
                 })
                 .map(|(i, col)| ResultSetColumn {
                     alias: None,
-                    expr: ast::Expr::Column {
+                    expr: MaybeMut::Owned(ast::Expr::Column {
                         database: None,
                         table: current_table_index,
                         column: i,
                         is_rowid_alias: col.is_rowid_alias,
-                    },
+                    }),
                     contains_aggregates: false,
                 }),
         );
@@ -581,9 +585,9 @@ pub struct JoinInfo {
 /// - `t` and `p` are [Table::BTree] while `sub` is [Table::FromClauseSubquery]
 /// - join_info is None for the first table reference, and Some(JoinInfo { outer: false, using: None }) for the second and third table references
 #[derive(Debug, Clone)]
-pub struct TableReference {
+pub struct TableReference<'ast> {
     /// The operation that this table reference performs.
-    pub op: Operation,
+    pub op: Operation<'ast>,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -630,7 +634,7 @@ impl ColumnUsedMask {
 }
 
 #[derive(Clone, Debug)]
-pub enum Operation {
+pub enum Operation<'ast> {
     // Scan operation
     // This operation is used to scan a table.
     // The iter_dir is used to indicate the direction of the iterator.
@@ -642,10 +646,10 @@ pub enum Operation {
     // Search operation
     // This operation is used to search for a row in a table using an index
     // (i.e. a primary key or a secondary index)
-    Search(Search),
+    Search(Search<'ast>),
 }
 
-impl Operation {
+impl<'ast> Operation<'_> {
     pub fn index(&self) -> Option<&Arc<Index>> {
         match self {
             Operation::Scan { index, .. } => index.as_ref(),
@@ -655,7 +659,7 @@ impl Operation {
     }
 }
 
-impl TableReference {
+impl<'ast> TableReference<'_> {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Rc<BTreeTable>> {
         match &self.table {
@@ -824,13 +828,13 @@ impl TableReference {
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
 /// [TerminationKey] is the condition that is used to terminate the search after a seek.
 #[derive(Debug, Clone)]
-pub struct SeekDef {
+pub struct SeekDef<'ast> {
     /// The key to use when seeking and when terminating the scan that follows the seek.
     /// For example, given:
     /// - CREATE INDEX i ON t (x, y desc)
     /// - SELECT * FROM t WHERE x = 1 AND y >= 30
     /// The key is [(1, ASC), (30, DESC)]
-    pub key: Vec<(ast::Expr, SortOrder)>,
+    pub key: Vec<(PlanExpr<'ast>, SortOrder)>,
     /// The condition to use when seeking. See [SeekKey] for more details.
     pub seek: Option<SeekKey>,
     /// The condition to use when terminating the scan that follows the seek. See [TerminationKey] for more details.
@@ -875,21 +879,21 @@ pub struct TerminationKey {
 /// (i.e. a primary key or a secondary index)
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
-pub enum Search {
+pub enum Search<'ast> {
     /// A rowid equality point lookup. This is a special case that uses the SeekRowid bytecode instruction and does not loop.
-    RowidEq { cmp_expr: ast::Expr },
+    RowidEq { cmp_expr: PlanExpr<'ast> },
     /// A search on a table btree (via `rowid`) or a secondary index search. Uses bytecode instructions like SeekGE, SeekGT etc.
     Seek {
         index: Option<Arc<Index>>,
-        seek_def: SeekDef,
+        seek_def: SeekDef<'ast>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
     pub func: AggFunc,
-    pub args: Vec<ast::Expr>,
-    pub original_expr: ast::Expr,
+    pub args: Vec<Expr>,
+    pub original_expr: Expr,
     pub distinctness: Distinctness,
 }
 
@@ -912,7 +916,7 @@ impl Display for Aggregate {
 }
 
 /// For EXPLAIN QUERY PLAN
-impl Display for Plan {
+impl<'ast> Display for Plan<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Select(select_plan) => select_plan.fmt(f),
@@ -957,7 +961,7 @@ impl Display for Plan {
     }
 }
 
-impl Display for SelectPlan {
+impl Display for SelectPlan<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         writeln!(f, "QUERY PLAN")?;
 
@@ -1008,7 +1012,7 @@ impl Display for SelectPlan {
     }
 }
 
-impl Display for DeletePlan {
+impl Display for DeletePlan<'_> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         writeln!(f, "QUERY PLAN")?;
 
@@ -1035,7 +1039,7 @@ impl Display for DeletePlan {
     }
 }
 
-impl fmt::Display for UpdatePlan {
+impl fmt::Display for UpdatePlan<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "QUERY PLAN")?;
 

@@ -4,9 +4,10 @@ use crate::{
     schema::{Column, Index},
     translate::{
         expr::as_binary_components,
-        plan::{JoinOrderMember, TableReference, WhereTerm},
+        plan::{JoinOrderMember, PlanExpr, TableReference, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
+    util::MaybeMut,
     Result,
 };
 use limbo_sqlite3_parser::ast::{self, SortOrder};
@@ -58,16 +59,16 @@ pub enum BinaryExprSide {
 
 impl Constraint {
     /// Get the constraining expression, e.g. '2+3' from 't.x = 2+3'
-    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> ast::Expr {
+    pub fn get_constraining_expr(&self, where_clause: &[WhereTerm]) -> PlanExpr {
         let (idx, side) = self.where_clause_pos;
         let where_term = &where_clause[idx];
         let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
             panic!("Expected a valid binary expression");
         };
         if side == BinaryExprSide::Lhs {
-            lhs.clone()
+            MaybeMut::Owned(lhs.clone())
         } else {
-            rhs.clone()
+            MaybeMut::Owned(rhs.clone())
         }
     }
 }
@@ -87,11 +88,11 @@ pub struct ConstraintRef {
 
 impl ConstraintRef {
     /// Convert the constraint to a column usable in a [crate::translate::plan::SeekDef::key].
-    pub fn as_seek_key_column(
+    pub fn as_seek_key_column<'ast>(
         &self,
-        constraints: &[Constraint],
-        where_clause: &[WhereTerm],
-    ) -> (ast::Expr, SortOrder) {
+        constraints: &'ast [Constraint],
+        where_clause: &[WhereTerm<'ast>],
+    ) -> (PlanExpr<'ast>, SortOrder) {
         let constraint = &constraints[self.constraint_vec_pos];
         let constraining_expr = constraint.get_constraining_expr(where_clause);
         (constraining_expr, self.sort_order)
@@ -169,9 +170,9 @@ fn estimate_selectivity(column: &Column, op: ast::Operator) -> f64 {
 
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
-pub fn constraints_from_where_clause(
-    where_clause: &[WhereTerm],
-    table_references: &[TableReference],
+pub fn constraints_from_where_clause<'ast>(
+    where_clause: &[WhereTerm<'ast>],
+    table_references: &[TableReference<'ast>],
     available_indexes: &HashMap<String, Vec<Arc<Index>>>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();

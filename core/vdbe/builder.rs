@@ -22,7 +22,7 @@ use crate::{
 
 use super::{BranchOffset, CursorID, Insn, InsnFunction, InsnReference, JumpTarget, Program};
 #[allow(dead_code)]
-pub struct ProgramBuilder {
+pub struct ProgramBuilder<'ast> {
     next_free_register: usize,
     next_free_cursor_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -40,8 +40,8 @@ pub struct ProgramBuilder {
     // map of instruction index to manual comment (used in EXPLAIN only)
     comments: Option<Vec<(InsnReference, &'static str)>>,
     pub parameters: Parameters,
-    pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: Vec<TableReference>,
+    pub result_columns: Vec<ResultSetColumn<'ast>>,
+    pub table_references: Vec<TableReference<'ast>>,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
     /// Current parsing nesting level
@@ -71,12 +71,10 @@ pub enum QueryMode {
     Explain,
 }
 
-impl From<ast::Cmd> for QueryMode {
-    fn from(stmt: ast::Cmd) -> Self {
-        match stmt {
-            ast::Cmd::ExplainQueryPlan(_) | ast::Cmd::Explain(_) => QueryMode::Explain,
-            _ => QueryMode::Normal,
-        }
+pub fn query_mode_from_stmt(stmt: &ast::Cmd) -> QueryMode {
+    match stmt {
+        ast::Cmd::ExplainQueryPlan(_) | ast::Cmd::Explain(_) => QueryMode::Explain,
+        _ => QueryMode::Normal,
     }
 }
 
@@ -87,7 +85,7 @@ pub struct ProgramBuilderOpts {
     pub approx_num_labels: usize,
 }
 
-impl ProgramBuilder {
+impl ProgramBuilder<'_> {
     pub fn new(opts: ProgramBuilderOpts) -> Self {
         Self {
             next_free_register: 1,

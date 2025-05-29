@@ -172,7 +172,11 @@ pub enum TransactionMode {
 
 /// Main entry point for emitting bytecode for a SQL query
 /// Takes a query plan and generates the corresponding bytecode program
-pub fn emit_program(program: &mut ProgramBuilder, plan: Plan, syms: &SymbolTable) -> Result<()> {
+pub fn emit_program<'ast>(
+    program: &mut ProgramBuilder<'ast>,
+    plan: Plan<'ast>,
+    syms: &SymbolTable,
+) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, plan, syms),
         Plan::Delete(plan) => emit_program_for_delete(program, plan, syms),
@@ -181,9 +185,9 @@ pub fn emit_program(program: &mut ProgramBuilder, plan: Plan, syms: &SymbolTable
     }
 }
 
-fn emit_program_for_compound_select(
-    program: &mut ProgramBuilder,
-    plan: Plan,
+fn emit_program_for_compound_select<'ast>(
+    program: &mut ProgramBuilder<'ast>,
+    plan: Plan<'ast>,
     syms: &SymbolTable,
 ) -> Result<()> {
     let Plan::CompoundSelect {
@@ -276,9 +280,9 @@ fn emit_program_for_compound_select(
     Ok(())
 }
 
-fn emit_program_for_select(
-    program: &mut ProgramBuilder,
-    mut plan: SelectPlan,
+fn emit_program_for_select<'ast>(
+    program: &mut ProgramBuilder<'ast>,
+    mut plan: SelectPlan<'ast>,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
@@ -458,9 +462,9 @@ pub fn emit_query<'a>(
     Ok(t_ctx.reg_result_cols_start.unwrap())
 }
 
-fn emit_program_for_delete(
-    program: &mut ProgramBuilder,
-    mut plan: DeletePlan,
+fn emit_program_for_delete<'ast>(
+    program: &mut ProgramBuilder<'ast>,
+    mut plan: DeletePlan<'ast>,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
@@ -529,8 +533,8 @@ fn emit_program_for_delete(
     Ok(())
 }
 
-fn emit_delete_insns(
-    program: &mut ProgramBuilder,
+fn emit_delete_insns<'ast>(
+    program: &mut ProgramBuilder<'ast>,
     t_ctx: &mut TranslateCtx,
     table_references: &[TableReference],
     index_references: &[Arc<Index>],
@@ -628,9 +632,9 @@ fn emit_delete_insns(
     Ok(())
 }
 
-fn emit_program_for_update(
-    program: &mut ProgramBuilder,
-    mut plan: UpdatePlan,
+fn emit_program_for_update<'ast>(
+    program: &mut ProgramBuilder<'ast>,
+    mut plan: UpdatePlan<'ast>,
     syms: &SymbolTable,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(

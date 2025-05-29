@@ -24,18 +24,18 @@ use super::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use super::optimizer::rewrite_expr;
 
 #[allow(clippy::too_many_arguments)]
-pub fn translate_insert(
+pub fn translate_insert<'ast>(
     query_mode: QueryMode,
     schema: &Schema,
     with: &Option<With>,
     on_conflict: &Option<ResolveType>,
     tbl_name: &QualifiedName,
     columns: &Option<DistinctNames>,
-    body: &mut InsertBody,
+    body: &'ast mut InsertBody,
     _returning: &Option<Vec<ResultColumn>>,
     syms: &SymbolTable,
-    mut program: ProgramBuilder,
-) -> Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> Result<ProgramBuilder<'ast>> {
     let opts = ProgramBuilderOpts {
         query_mode,
         num_cursors: 1,

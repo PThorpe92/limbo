@@ -1,4 +1,5 @@
 use crate::translate::plan::Operation;
+use crate::util::MaybeMut;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -6,12 +7,12 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode},
     SymbolTable,
 };
-use limbo_sqlite3_parser::ast::{self, Expr, ResultColumn, SortOrder, Update};
+use limbo_sqlite3_parser::ast::{self, ResultColumn, SortOrder, Update};
 
 use super::emitter::emit_program;
 use super::optimizer::optimize_plan;
 use super::plan::{
-    ColumnUsedMask, IterationDirection, Plan, ResultSetColumn, TableReference, UpdatePlan,
+    ColumnUsedMask, IterationDirection, Plan, PlanExpr, ResultSetColumn, TableReference, UpdatePlan,
 };
 use super::planner::bind_column_references;
 use super::planner::{parse_limit, parse_where};
@@ -46,14 +47,14 @@ addr  opcode         p1    p2    p3    p4             p5  comment
 17    Integer        5     7     0                    0   r[7]=5
 18    Goto           0     1     0                    0
 */
-pub fn translate_update(
+pub fn translate_update<'ast>(
     query_mode: QueryMode,
     schema: &Schema,
-    body: &mut Update,
+    body: &'ast mut Update,
     syms: &SymbolTable,
     parse_schema: ParseSchema,
-    mut program: ProgramBuilder,
-) -> crate::Result<ProgramBuilder> {
+    mut program: ProgramBuilder<'ast>,
+) -> crate::Result<ProgramBuilder<'ast>> {
     let mut plan = prepare_update_plan(schema, body, parse_schema)?;
     optimize_plan(&mut plan, schema)?;
     // TODO: freestyling these numbers
@@ -68,11 +69,11 @@ pub fn translate_update(
     Ok(program)
 }
 
-pub fn prepare_update_plan(
+pub fn prepare_update_plan<'ast>(
     schema: &Schema,
-    body: &mut Update,
+    body: &'ast mut Update,
     parse_schema: ParseSchema,
-) -> crate::Result<Plan> {
+) -> crate::Result<Plan<'ast>> {
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported");
     }
@@ -133,18 +134,18 @@ pub fn prepare_update_plan(
                 })?;
 
             let _ = bind_column_references(&mut set.expr, &mut table_references, None);
-            Ok((col_index, set.expr.clone()))
+            Ok((col_index, MaybeMut::Mut(&mut set.expr)))
         })
-        .collect::<Result<Vec<(usize, Expr)>, crate::LimboError>>()?;
+        .collect::<Result<Vec<(usize, PlanExpr<'ast>)>, crate::LimboError>>()?;
 
     let mut where_clause = vec![];
     let mut result_columns = vec![];
     if let Some(returning) = &mut body.returning {
         for rc in returning.iter_mut() {
-            if let ResultColumn::Expr(expr, alias) = rc {
+            if let ResultColumn::Expr(ref mut expr, alias) = rc {
                 bind_column_references(expr, &mut table_references, None)?;
                 result_columns.push(ResultSetColumn {
-                    expr: expr.clone(),
+                    expr: MaybeMut::Mut(expr),
                     alias: alias.as_ref().and_then(|a| {
                         if let ast::As::As(name) = a {
                             Some(name.to_string())
@@ -159,10 +160,15 @@ pub fn prepare_update_plan(
             }
         }
     }
-    let order_by = body.order_by.as_ref().map(|order| {
+    let order_by = body.order_by.as_mut().map(|order| {
         order
-            .iter()
-            .map(|o| (o.expr.clone(), o.order.unwrap_or(SortOrder::Asc)))
+            .iter_mut()
+            .map(|o| {
+                (
+                    MaybeMut::Mut(&mut o.expr),
+                    o.order.unwrap_or(SortOrder::Asc),
+                )
+            })
             .collect()
     });
     // Parse the WHERE clause

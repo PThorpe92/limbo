@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{ops::Deref, rc::Rc};
 
 use limbo_sqlite3_parser::ast::{self, SortOrder};
 
@@ -16,7 +16,7 @@ use crate::{
 use super::{
     emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
-    plan::{Distinctness, ResultSetColumn, SelectPlan, TableReference},
+    plan::{Distinctness, PlanExpr, ResultSetColumn, SelectPlan, TableReference},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
@@ -30,10 +30,10 @@ pub struct SortMetadata {
 }
 
 /// Initialize resources needed for ORDER BY processing
-pub fn init_order_by(
+pub fn init_order_by<'ast>(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
-    order_by: &[(ast::Expr, SortOrder)],
+    order_by: &[(PlanExpr<'ast>, SortOrder)],
     referenced_tables: &[TableReference],
 ) -> Result<()> {
     let sort_cursor = program.alloc_cursor_id(None, CursorType::Sorter);
@@ -51,7 +51,7 @@ pub fn init_order_by(
      */
     let collations = order_by
         .iter()
-        .map(|(expr, _)| match expr {
+        .map(|(expr, _)| match expr.deref() {
             ast::Expr::Collate(_, collation_name) => CollationSeq::new(collation_name).map(Some),
             ast::Expr::Column { table, column, .. } => {
                 let table_reference = referenced_tables.get(*table).unwrap();
@@ -298,8 +298,8 @@ pub fn sorter_insert(
 /// because the result columns should be emitted in the SELECT clause order, not the ORDER BY clause order.
 ///
 /// If any result columns can be skipped, this returns list of 2-tuples of (SkippedResultColumnIndex: usize, ResultColumnIndexInOrderBySorter: usize)
-pub fn order_by_deduplicate_result_columns(
-    order_by: &[(ast::Expr, SortOrder)],
+pub fn order_by_deduplicate_result_columns<'ast>(
+    order_by: &[(PlanExpr<'ast>, SortOrder)],
     result_columns: &[ResultSetColumn],
 ) -> Option<Vec<(usize, usize)>> {
     let mut result_column_remapping: Option<Vec<(usize, usize)>> = None;
